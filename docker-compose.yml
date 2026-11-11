@@ -1,0 +1,21 @@
+services:
+  beamsync-server:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: beamsync-server
+    restart: unless-stopped
+    ports:
+      - "${PORT:-8787}:8787/tcp"
+      - "${STUN_PORT:-3478}:3478/udp"
+    env_file:
+      - .env
+    environment:
+      PORT: "8787"
+      STUN_PORT: "3478"
+      DATA_DIR: "/data"
+    volumes:
+      - beamsync_data:/data
+
+volumes:
+  beamsync_data:

@@ -1,0 +1,39 @@
+app = "beamsync-server"
+primary_region = "sin"
+
+[build]
+  dockerfile = "Dockerfile"
+
+[env]
+  PORT = "8787"
+  STUN_PORT = "3478"
+  DATA_DIR = "/data"
+
+[mounts]
+  source = "beamsync_data"
+  destination = "/data"
+
+[[services]]
+  internal_port = 8787
+  protocol = "tcp"
+
+  [[services.ports]]
+    port = 80
+    handlers = ["http"]
+
+  [[services.ports]]
+    port = 443
+    handlers = ["tls", "http"]
+
+  [[services.http_checks]]
+    interval = "15s"
+    timeout = "3s"
+    method = "get"
+    path = "/healthz"
+
+[[services]]
+  internal_port = 3478
+  protocol = "udp"
+
+  [[services.ports]]
+    port = 3478

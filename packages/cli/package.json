@@ -1,0 +1,19 @@
+{
+  "name": "@beamsync/cli",
+  "version": "0.1.0",
+  "type": "module",
+  "bin": {
+    "beamsync": "./dist/bin.js"
+  },
+  "main": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "typecheck": "tsc -p tsconfig.json --noEmit"
+  },
+  "dependencies": {
+    "@beamsync/protocol": "0.1.0",
+    "@mongodb-js/zstd": "^2.0.0",
+    "ws": "^8.18.0"
+  }
+}
