@@ -6,6 +6,7 @@ COPY package.json package-lock.json tsconfig.base.json ./
 COPY packages/protocol/package.json packages/protocol/tsconfig.json ./packages/protocol/
 COPY packages/coordinator/package.json packages/coordinator/tsconfig.json ./packages/coordinator/
 COPY packages/server/package.json packages/server/tsconfig.json ./packages/server/
+COPY packages/edge-relay/package.json packages/edge-relay/tsconfig.json ./packages/edge-relay/
 COPY packages/cli/package.json packages/cli/tsconfig.json ./packages/cli/
 
 RUN npm ci --no-audit --no-fund
@@ -13,6 +14,7 @@ RUN npm ci --no-audit --no-fund
 COPY packages/protocol/src ./packages/protocol/src
 COPY packages/coordinator/src ./packages/coordinator/src
 COPY packages/server/src ./packages/server/src
+COPY packages/edge-relay/src ./packages/edge-relay/src
 COPY packages/cli/src ./packages/cli/src
 
 RUN npm run build

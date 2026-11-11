@@ -5,4 +5,5 @@ export * from "./stateIndex.js";
 export * from "./materializer.js";
 export * from "./framedStream.js";
 export * from "./udpHolePunch.js";
+export * from "./edgeRelayChannel.js";
 export * from "./syncClient.js";

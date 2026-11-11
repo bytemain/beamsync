@@ -1,0 +1,25 @@
+{
+  "name": "@beamsync/edge-relay",
+  "version": "0.1.0",
+  "type": "module",
+  "bin": {
+    "beamsync-edge-relay": "./dist/bin.js"
+  },
+  "main": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "default": "./dist/index.js"
+    }
+  },
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "typecheck": "tsc -p tsconfig.json --noEmit",
+    "start": "node ./dist/bin.js"
+  },
+  "dependencies": {
+    "@beamsync/protocol": "0.1.0",
+    "ws": "^8.18.0"
+  }
+}

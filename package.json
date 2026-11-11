@@ -7,6 +7,7 @@
     "packages/protocol",
     "packages/coordinator",
     "packages/server",
+    "packages/edge-relay",
     "packages/cli"
   ],
   "scripts": {
@@ -14,6 +15,7 @@
     "typecheck": "npm run build && npm run typecheck --workspaces --if-present",
     "test": "vitest run",
     "start:server": "npm --workspace @beamsync/server run start",
+    "start:edge-relay": "npm --workspace @beamsync/edge-relay run start",
     "setup:r2-lifecycle": "node scripts/setup-r2-lifecycle.mjs"
   },
   "devDependencies": {

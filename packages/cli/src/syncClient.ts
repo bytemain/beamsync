@@ -18,6 +18,7 @@ import {
   type ClientToServerWsMessage,
   type CreateManagedLeaseResponse,
   type CreatePairingResponse,
+  type EdgeRelayNodeInfo,
   type EndpointCandidate,
   type FastCdcOptions,
   type JoinPairingResponse,
@@ -26,6 +27,13 @@ import {
   type SessionKeyMaterial,
   type TransportTier,
 } from "@beamsync/protocol";
+import {
+  connectEdgeRelayBinaryChannel,
+  probeEdgeRelayRtts,
+  receivePacksFromEdgeRelay,
+  streamPackBatchesOverEdgeRelay,
+  type EdgeRelayBinaryChannel,
+} from "./edgeRelayChannel.js";
 import {
   connectToCandidate,
   createTargetDirectListeners,
@@ -55,6 +63,9 @@ export interface TransferCommonOptions {
   disableP2p?: boolean;
   disableP2pTcp?: boolean;
   disableP2pUdp?: boolean;
+  disableEdgeRelay?: boolean;
+  preferEdgeRelay?: boolean;
+  edgeRelayMaxBytes?: number;
   allowLoopbackUdpForTest?: boolean;
   forceTier?: TransportTier;
   targetPackBytes?: number;
@@ -77,6 +88,7 @@ export interface SendDirectoryOptions extends TransferCommonOptions {
   customSecretWords?: string;
   extraIgnoreRules?: string[];
   simulateP2pDropAfterPacks?: number;
+  simulateEdgeRelayDropAfterPacks?: number;
   onPairingCode?: (pairingCode: string, sessionId: string) => void;
 }
 
@@ -90,6 +102,7 @@ export interface SendTransferSummary {
   sessionId: string;
   pairingCode?: string;
   selectedTier: TransportTier;
+  selectedEdgeRelayRegion?: string;
   fallbackToR2Triggered: boolean;
   rootTreeDigest: string;
   logicalBytes: number;
@@ -107,6 +120,7 @@ export interface SendTransferSummary {
 export interface ReceiveTransferSummary {
   sessionId: string;
   selectedTier: TransportTier;
+  selectedEdgeRelayRegion?: string;
   fallbackToR2Triggered: boolean;
   rootTreeDigest: string;
   committedFiles: number;
@@ -117,6 +131,7 @@ export interface ReceiveTransferSummary {
 
 const DEFAULT_TARGET_PACK_BYTES = 8 * 1024 * 1024; // 8 MiB
 const DEFAULT_STREAM_RELAY_THRESHOLD_BYTES = 8 * 1024 * 1024; // 8 MiB
+const DEFAULT_EDGE_RELAY_MAX_BYTES = 512 * 1024 * 1024; // 512 MiB default DERP cut-through cap before R2_PIPELINE
 const RELAY_FRAME_SLICE_BYTES = 256 * 1024; // 256 KiB per WS frame
 
 export async function sendDirectory(
@@ -157,6 +172,7 @@ export async function sendDirectory(
     peerToken: createRes.peerToken,
     wsUrl: createRes.wsUrl,
     stunServers: createRes.stunServers,
+    edgeRelays: createRes.edgeRelays,
     mode: { kind: "pake", secretPhrase: secretWords, pairingCode },
   });
 }
@@ -193,6 +209,7 @@ export async function receiveDirectory(
     peerToken: joinRes.peerToken,
     wsUrl: joinRes.wsUrl,
     stunServers: joinRes.stunServers,
+    edgeRelays: joinRes.edgeRelays,
     mode: { kind: "pake", secretPhrase: parsed.secretPhrase },
   });
 }
@@ -218,6 +235,7 @@ export async function sendWithManagedLease(params: {
     scopeCasKeyHex?: string;
     wsUrl: string;
     stunServers: string[];
+    edgeRelays?: EdgeRelayNodeInfo[];
   };
 }): Promise<SendTransferSummary> {
   return runSourceSession({
@@ -226,6 +244,7 @@ export async function sendWithManagedLease(params: {
     peerToken: params.lease.sourceToken,
     wsUrl: params.lease.wsUrl,
     stunServers: params.lease.stunServers,
+    edgeRelays: params.lease.edgeRelays,
     mode: {
       kind: "lease",
       leaseSecretHex: params.lease.leaseSecretHex,
@@ -243,6 +262,7 @@ export async function receiveWithManagedLease(params: {
     scopeCasKeyHex?: string;
     wsUrl: string;
     stunServers: string[];
+    edgeRelays?: EdgeRelayNodeInfo[];
   };
 }): Promise<ReceiveTransferSummary> {
   return runTargetSession({
@@ -251,6 +271,7 @@ export async function receiveWithManagedLease(params: {
     peerToken: params.lease.targetToken,
     wsUrl: params.lease.wsUrl,
     stunServers: params.lease.stunServers,
+    edgeRelays: params.lease.edgeRelays,
     mode: {
       kind: "lease",
       leaseSecretHex: params.lease.leaseSecretHex,
@@ -351,25 +372,30 @@ async function runSourceSession(params: {
   peerToken: string;
   wsUrl: string;
   stunServers: string[];
+  edgeRelays?: EdgeRelayNodeInfo[];
   mode:
     | { kind: "pake"; secretPhrase: string; pairingCode: string }
     | { kind: "lease"; leaseSecretHex: string; scopeCasKeyHex?: string };
 }): Promise<SendTransferSummary> {
   const startedAt = Date.now();
-  const { options, sessionId, wsUrl, stunServers } = params;
+  const { options, sessionId, wsUrl, stunServers, edgeRelays } = params;
   const sig = await SignalingClient.connect(wsUrl);
   let udpPrep: Awaited<ReturnType<typeof prepareUdpPunchEndpoint>> | null = null;
   let directSock: FramedSocketChannel | null = null;
   let udpChan: UdpHolePunchChannel | null = null;
+  let edgeChan: EdgeRelayBinaryChannel | null = null;
 
   try {
-    // Start scanning source workspace immediately in parallel with peer pairing
+    // Start scanning source workspace and probing DERP Edge Relay RTTs immediately in parallel
     const sourceScanPromise = scanWorkspace(options.sourceDir, {
       cacheDir: options.cacheDir,
       extraIgnoreRules: options.extraIgnoreRules,
       smallFileThresholdBytes: options.smallFileThresholdBytes,
       cdcOptions: options.cdcOptions,
     });
+    const relayRttPromise = options.disableEdgeRelay
+      ? Promise.resolve<Record<string, number>>({})
+      : probeEdgeRelayRtts(edgeRelays, 1000);
 
     const pake =
       params.mode.kind === "pake"
@@ -432,6 +458,7 @@ async function runSourceSession(params: {
       );
     }
 
+    const relayRttMs = await relayRttPromise;
     const peerConfirmedPromise = sig.waitFor("peer_confirmed", 20_000);
     const targetBlobsPromise = sig.waitFor("target_have_blobs", 60_000);
 
@@ -440,6 +467,7 @@ async function runSourceSession(params: {
       confirmMacHex: myConfirmMacHex,
       hostFingerprint,
       candidates: udpPrep ? udpPrep.candidates : [],
+      relayRttMs,
     });
 
     const peerConfirmed = await peerConfirmedPromise;
@@ -476,8 +504,11 @@ async function runSourceSession(params: {
 
     // Negotiate transport tier
     let selectedTier: TransportTier = "R2_PIPELINE";
+    let selectedEdgeRelayRegion: string | undefined;
     const relayThreshold =
       options.streamRelayThresholdBytes ?? DEFAULT_STREAM_RELAY_THRESHOLD_BYTES;
+    const edgeRelayMaxBytes =
+      options.edgeRelayMaxBytes ?? DEFAULT_EDGE_RELAY_MAX_BYTES;
 
     if (missingHashes.length === 0) {
       selectedTier = options.forceTier ?? "STREAM_RELAY";
@@ -514,9 +545,14 @@ async function runSourceSession(params: {
         if (!directSock && !udpChan) {
           throw new Error("Forced P2P_DIRECT tier failed to establish");
         }
+      } else if (selectedTier === "EDGE_RELAY") {
+        if (!peerConfirmed.selectedEdgeRelay) {
+          throw new Error("Forced EDGE_RELAY tier requested, but no Edge Relay is registered");
+        }
+        selectedEdgeRelayRegion = peerConfirmed.selectedEdgeRelay.region;
       }
     } else {
-      // Automatic 4-Tier Happy Eyeballs Negotiation:
+      // Automatic 5-Tier Happy Eyeballs Negotiation:
       // 1. Same-host LOCAL_IPC
       if (peerConfirmed.sameHostMatch && !options.disableLocalIpc) {
         directSock = await tryConnectCandidates(
@@ -563,19 +599,29 @@ async function runSourceSession(params: {
         }
       }
 
-      // 3. Micro-delta STREAM_RELAY vs 4. Bulk R2_PIPELINE
+      // 3. DERP-style EDGE_RELAY (multi-region binary cut-through WSS / IP+TLS)
+      //    vs 4. Micro-delta STREAM_RELAY vs 5. Bulk CAS R2_PIPELINE
       if (!directSock && !udpChan) {
-        selectedTier =
-          missingBytesEstimate <= relayThreshold
-            ? "STREAM_RELAY"
-            : "R2_PIPELINE";
+        if (
+          !options.disableEdgeRelay &&
+          peerConfirmed.selectedEdgeRelay &&
+          (options.preferEdgeRelay || missingBytesEstimate <= edgeRelayMaxBytes)
+        ) {
+          selectedTier = "EDGE_RELAY";
+          selectedEdgeRelayRegion = peerConfirmed.selectedEdgeRelay.region;
+        } else {
+          selectedTier =
+            missingBytesEstimate <= relayThreshold
+              ? "STREAM_RELAY"
+              : "R2_PIPELINE";
+        }
       }
     }
 
     options.onProgress?.({
       phase: "streaming",
       tier: selectedTier,
-      detail: `missing=${missingHashes.length} blobs (${missingBytesEstimate} B)`,
+      detail: `missing=${missingHashes.length} blobs (${missingBytesEstimate} B)${selectedEdgeRelayRegion ? ` relay=${selectedEdgeRelayRegion}` : ""}`,
     });
 
     const committedPromise = sig.waitFor("session_committed", 120_000);
@@ -587,6 +633,7 @@ async function runSourceSession(params: {
       missingBlobCount: missingHashes.length,
       missingBytesEstimate,
       selectedTier,
+      selectedEdgeRelayRegion,
     });
 
     const targetPackBytes = options.targetPackBytes ?? DEFAULT_TARGET_PACK_BYTES;
@@ -682,6 +729,85 @@ async function runSourceSession(params: {
         wireBytesSent += r2Stats.wireBytesUploaded;
         casSkippedPacks += r2Stats.casSkippedPacks;
       }
+    } else if (selectedTier === "EDGE_RELAY" && peerConfirmed.selectedEdgeRelay) {
+      const alloc = peerConfirmed.selectedEdgeRelay;
+      let ackedPackIds: string[] = [];
+      let unackedBatches: string[][] = [];
+
+      try {
+        edgeChan = await connectEdgeRelayBinaryChannel({
+          wsRelayUrl: alloc.wsRelayUrl,
+          role: "source",
+          transportKey: keys.transportKey,
+          sessionId,
+          certSha256: alloc.certSha256,
+          noSni: alloc.noSni,
+        });
+
+        const streamRes = await streamPackBatchesOverEdgeRelay({
+          channel: edgeChan,
+          totalBatches: batches.length,
+          simulateDropAfterPacks: options.simulateEdgeRelayDropAfterPacks,
+          producePackAt: async (idx) => {
+            const blobs = await readBlobBatch(batches[idx], sourceScan.blobSlices);
+            return encodePack(blobs, {
+              compression: "zstd",
+              encryption: "chacha20-poly1305",
+              packKey: keys.packKey,
+              zstdCompressFn: zstdCompress,
+            });
+          },
+        });
+
+        wireBytesSent += streamRes.wireBytesSent;
+        ackedPackIds = streamRes.ackedPackIds;
+        if (!streamRes.interrupted) {
+          for (const pid of streamRes.allPackIds) {
+            if (pid) requiredPackIds.push(pid);
+          }
+        } else {
+          requiredPackIds.push(...ackedPackIds);
+          unackedBatches = batches.filter(
+            (_, idx) => !streamRes.ackedBatchIndices.has(idx),
+          );
+        }
+      } catch (err) {
+        if (
+          options.forceTier === "EDGE_RELAY" &&
+          err instanceof Error &&
+          err.message.includes("EDGE_RELAY_CERT_PIN_MISMATCH")
+        ) {
+          throw err;
+        }
+        unackedBatches = batches;
+      }
+
+      if (unackedBatches.length > 0) {
+        fallbackToR2Triggered = true;
+        selectedTier = "R2_PIPELINE";
+        const fallbackActivatedPromise = sig.waitFor(
+          "fallback_to_r2_activated",
+          10_000,
+        );
+        sig.send({
+          type: "fallback_to_r2",
+          reason: "Edge Relay stream interrupted; switching remaining packs to R2_PIPELINE",
+          targetReceivedPackIds: ackedPackIds,
+        });
+        await fallbackActivatedPromise;
+
+        const r2Stats = await uploadPackBatchesToR2({
+          batches: unackedBatches,
+          blobSlices: sourceScan.blobSlices,
+          packKey: keys.packKey,
+          convergent: convergentPacks,
+          sig,
+          concurrency: options.uploadConcurrency ?? 8,
+        });
+        requiredPackIds.push(...r2Stats.packIds);
+        wireBytesSent += r2Stats.wireBytesUploaded;
+        casSkippedPacks += r2Stats.casSkippedPacks;
+      }
     } else if (selectedTier === "STREAM_RELAY") {
       for (const batchHashes of batches) {
         const blobs = await readBlobBatch(batchHashes, sourceScan.blobSlices);
@@ -743,6 +869,7 @@ async function runSourceSession(params: {
       pairingCode:
         params.mode.kind === "pake" ? params.mode.pairingCode : undefined,
       selectedTier,
+      selectedEdgeRelayRegion,
       fallbackToR2Triggered,
       rootTreeDigest: sourceScan.rootTreeDigest,
       logicalBytes: sourceScan.manifest.totalLogicalBytes,
@@ -757,6 +884,7 @@ async function runSourceSession(params: {
       durationMs: Date.now() - startedAt,
     };
   } finally {
+    edgeChan?.destroy();
     directSock?.destroy();
     udpChan?.destroy();
     await udpPrep?.close();
@@ -770,27 +898,32 @@ async function runTargetSession(params: {
   peerToken: string;
   wsUrl: string;
   stunServers: string[];
+  edgeRelays?: EdgeRelayNodeInfo[];
   mode:
     | { kind: "pake"; secretPhrase: string }
     | { kind: "lease"; leaseSecretHex: string; scopeCasKeyHex?: string };
 }): Promise<ReceiveTransferSummary> {
   const startedAt = Date.now();
-  const { options, sessionId, wsUrl, stunServers } = params;
+  const { options, sessionId, wsUrl, stunServers, edgeRelays } = params;
   const sig = await SignalingClient.connect(wsUrl);
   let directListeners: Awaited<
     ReturnType<typeof createTargetDirectListeners>
   > | null = null;
   let udpPrep: Awaited<ReturnType<typeof prepareUdpPunchEndpoint>> | null = null;
   let udpChan = null as UdpHolePunchChannel | null;
+  let edgeChan = null as EdgeRelayBinaryChannel | null;
   let materializer: AtomicWorkspaceMaterializer | null = null;
 
   try {
-    // Scan existing target directory (if present) in parallel to advertise existing blobs
+    // Scan existing target directory and probe DERP Edge Relay RTTs in parallel
     const existingTargetScanPromise = scanWorkspace(options.targetDir, {
       cacheDir: options.cacheDir,
       smallFileThresholdBytes: options.smallFileThresholdBytes,
       cdcOptions: options.cdcOptions,
     }).catch(() => null);
+    const relayRttPromise = options.disableEdgeRelay
+      ? Promise.resolve<Record<string, number>>({})
+      : probeEdgeRelayRtts(edgeRelays, 1000);
 
     const pake =
       params.mode.kind === "pake"
@@ -866,6 +999,7 @@ async function runTargetSession(params: {
       );
     }
 
+    const relayRttMs = await relayRttPromise;
     const peerConfirmedPromise = sig.waitFor("peer_confirmed", 20_000);
     sig.send({
       type: "pake_confirm",
@@ -875,6 +1009,7 @@ async function runTargetSession(params: {
         ...directListeners.candidates,
         ...(udpPrep ? udpPrep.candidates : []),
       ],
+      relayRttMs,
     });
 
     const peerConfirmed = await peerConfirmedPromise;
@@ -1104,6 +1239,52 @@ async function runTargetSession(params: {
         await waitUntil(() => grantCommitReceived || Boolean(sessionFatalError));
         if (sessionFatalError) throw sessionFatalError;
       }
+    } else if (selectedTier === "EDGE_RELAY") {
+      try {
+        const alloc = peerConfirmed.selectedEdgeRelay;
+        if (!alloc) {
+          throw new Error("Missing selectedEdgeRelay allocation on target");
+        }
+        edgeChan = await connectEdgeRelayBinaryChannel({
+          wsRelayUrl: alloc.wsRelayUrl,
+          role: "target",
+          transportKey: keys.transportKey,
+          sessionId,
+          certSha256: alloc.certSha256,
+          noSni: alloc.noSni,
+        });
+        await Promise.race([
+          receivePacksFromEdgeRelay(edgeChan, applyPackWireBytes),
+          waitForFallbackTrigger(() => fallbackToR2Triggered, (fn) => {
+            notifyFallback = fn;
+          }),
+        ]);
+        edgeChan.destroy();
+      } catch (err) {
+        if (
+          options.forceTier === "EDGE_RELAY" &&
+          err instanceof Error &&
+          err.message.includes("EDGE_RELAY_CERT_PIN_MISMATCH")
+        ) {
+          throw err;
+        }
+        if (!fallbackToR2Triggered) {
+          sig.send({
+            type: "fallback_to_r2",
+            reason: "Target Edge Relay reader interrupted",
+            targetReceivedPackIds: Array.from(appliedPackIds),
+          });
+          fallbackToR2Triggered = true;
+        }
+      }
+
+      if (fallbackToR2Triggered) {
+        selectedTier = "R2_PIPELINE";
+        await runR2ConcurrentDownloadUntilGrant();
+      } else {
+        await waitUntil(() => grantCommitReceived || Boolean(sessionFatalError));
+        if (sessionFatalError) throw sessionFatalError;
+      }
     } else if (selectedTier === "STREAM_RELAY") {
       while (!grantCommitReceived) {
         if (sessionFatalError) throw sessionFatalError;
@@ -1134,6 +1315,7 @@ async function runTargetSession(params: {
     return {
       sessionId,
       selectedTier,
+      selectedEdgeRelayRegion: plan.selectedEdgeRelayRegion,
       fallbackToR2Triggered,
       rootTreeDigest: plan.rootTreeDigest,
       committedFiles,
@@ -1145,6 +1327,7 @@ async function runTargetSession(params: {
     await materializer?.abort();
     throw err;
   } finally {
+    edgeChan?.destroy();
     udpChan?.destroy();
     await udpPrep?.close();
     await directListeners?.closeAll();
@@ -1426,6 +1609,7 @@ function waitForFallbackTrigger(
 export async function runDoctor(serverUrl: string): Promise<{
   serverHealth: Record<string, unknown>;
   stunReflexiveEndpoint: { ip: string; port: number } | null;
+  edgeRelayRttMs: Record<string, number>;
   zstdSelfTestOk: boolean;
 }> {
   const baseHttp = serverUrl.replace(/\/+$/, "");
@@ -1437,8 +1621,14 @@ export async function runDoctor(serverUrl: string): Promise<{
   const stunServers = Array.isArray(serverHealth.stunServers)
     ? (serverHealth.stunServers as string[])
     : ["stun:stun.cloudflare.com:3478"];
+  const edgeRelays = Array.isArray(serverHealth.edgeRelays)
+    ? (serverHealth.edgeRelays as EdgeRelayNodeInfo[])
+    : [];
 
-  const prep = await prepareUdpPunchEndpoint(stunServers);
+  const [prep, edgeRelayRttMs] = await Promise.all([
+    prepareUdpPunchEndpoint(stunServers),
+    probeEdgeRelayRtts(edgeRelays, 1500),
+  ]);
   const udpCand = prep.candidates.find((c) => c.kind === "udp_punch");
   await prep.close();
 
@@ -1453,6 +1643,7 @@ export async function runDoctor(serverUrl: string): Promise<{
     stunReflexiveEndpoint: udpCand
       ? { ip: udpCand.address, port: udpCand.port! }
       : null,
+    edgeRelayRttMs,
     zstdSelfTestOk,
   };
 }

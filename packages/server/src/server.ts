@@ -5,10 +5,14 @@ import { mkdir, rename, stat, unlink } from "node:fs/promises";
 import { pipeline } from "node:stream/promises";
 import { WebSocketServer, type WebSocket } from "ws";
 import {
+  bytesToHex,
   constantTimeEqual,
   randomBytes,
   utf8Bytes,
+  verifyEdgeRelayHeartbeat,
   type CreateManagedLeaseRequest,
+  type EdgeRelayHeartbeatPayload,
+  type EdgeRelayNodeInfo,
 } from "@beamsync/protocol";
 import {
   CoordinatorEngine,
@@ -36,6 +40,8 @@ export interface BeamSyncServerConfig {
   stunPort?: number | null; // null disables built-in UDP STUN; 0 picks ephemeral port
   publicStunHost?: string;
   extraStunServers?: string[];
+  relayAuthSecret?: string;
+  initialEdgeRelays?: EdgeRelayNodeInfo[];
   apiToken?: string;
   r2?: R2StorageConfig;
   builtinPutDelayMs?: number; // Test hook to observe concurrent upload/download overlap
@@ -102,10 +108,14 @@ export async function startBeamSyncServer(
     stunServers.push("stun:stun.cloudflare.com:3478");
   }
 
+  const relayAuthSecret =
+    config.relayAuthSecret?.trim() || bytesToHex(randomBytes(32));
   const persistence = new FileWalPersistence(dataDir);
   const coordinator = new CoordinatorEngine({
     storageDriver,
     stunServers,
+    relayAuthSecret,
+    initialEdgeRelays: config.initialEdgeRelays,
     persistence,
   });
   await coordinator.init();
@@ -122,6 +132,42 @@ export async function startBeamSyncServer(
           version: "0.1.0",
           ...coordinator.getStats(),
         });
+        return;
+      }
+
+      if (method === "GET" && reqUrl.pathname === "/v1/edge-relays") {
+        sendJson(res, 200, {
+          edgeRelays: coordinator.listActiveEdgeRelays(),
+        });
+        return;
+      }
+
+      if (method === "POST" && reqUrl.pathname === "/v1/edge-relays/heartbeat") {
+        const body = await readJsonBody<EdgeRelayHeartbeatPayload>(req);
+        if (
+          !body.relayId ||
+          !body.region ||
+          !body.httpUrl ||
+          !body.wsUrl ||
+          !body.signature ||
+          !verifyEdgeRelayHeartbeat(relayAuthSecret, body)
+        ) {
+          sendJson(res, 401, { error: "INVALID_RELAY_SIGNATURE" });
+          return;
+        }
+        coordinator.upsertEdgeRelay(
+          {
+            relayId: body.relayId,
+            region: body.region,
+            httpUrl: body.httpUrl,
+            wsUrl: body.wsUrl,
+            stunUrl: body.stunUrl,
+            certSha256: body.certSha256,
+            noSni: body.noSni,
+          },
+          false,
+        );
+        sendJson(res, 200, { ok: true });
         return;
       }
 

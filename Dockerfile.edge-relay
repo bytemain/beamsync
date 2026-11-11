@@ -1,0 +1,46 @@
+# syntax=docker/dockerfile:1
+FROM node:22-alpine AS builder
+WORKDIR /app
+
+COPY package.json package-lock.json tsconfig.base.json ./
+COPY packages/protocol/package.json packages/protocol/tsconfig.json ./packages/protocol/
+COPY packages/coordinator/package.json packages/coordinator/tsconfig.json ./packages/coordinator/
+COPY packages/server/package.json packages/server/tsconfig.json ./packages/server/
+COPY packages/edge-relay/package.json packages/edge-relay/tsconfig.json ./packages/edge-relay/
+COPY packages/cli/package.json packages/cli/tsconfig.json ./packages/cli/
+
+RUN npm ci --no-audit --no-fund
+
+COPY packages/protocol/src ./packages/protocol/src
+COPY packages/edge-relay/src ./packages/edge-relay/src
+
+RUN npm --workspace @beamsync/protocol run build && \
+    npm --workspace @beamsync/edge-relay run build
+
+FROM node:22-alpine AS runner
+WORKDIR /app
+ENV NODE_ENV=production
+ENV PORT=8443
+ENV STUN_PORT=3478
+ENV TLS_CACHE_FILE=/tls/derp-tls.json
+
+COPY --from=builder /app/package.json /app/package-lock.json ./
+COPY --from=builder /app/packages/protocol/package.json ./packages/protocol/
+COPY --from=builder /app/packages/protocol/dist ./packages/protocol/dist
+COPY --from=builder /app/packages/edge-relay/package.json ./packages/edge-relay/
+COPY --from=builder /app/packages/edge-relay/dist ./packages/edge-relay/dist
+
+RUN npm ci --omit=dev --no-audit --no-fund \
+      --workspace=@beamsync/protocol \
+      --workspace=@beamsync/edge-relay && \
+    mkdir -p /tls && chown -R node:node /tls /app
+USER node
+
+EXPOSE 8443/tcp
+EXPOSE 3478/udp
+VOLUME ["/tls"]
+
+HEALTHCHECK --interval=15s --timeout=3s --start-period=5s --retries=3 \
+  CMD node -e "const p=process.env.PORT||8443;fetch('http://127.0.0.1:'+p+'/healthz').then(r=>{if(!r.ok)throw 1}).catch(()=>new Promise((ok,no)=>{const h=require('node:https').get({host:'127.0.0.1',port:p,path:'/healthz',rejectUnauthorized:false},res=>res.statusCode===200?ok():no());h.on('error',no)}))" || exit 1
+
+CMD ["node", "packages/edge-relay/dist/bin.js"]

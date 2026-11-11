@@ -1,5 +1,44 @@
 #!/usr/bin/env node
+import type { EdgeRelayNodeInfo } from "@beamsync/protocol";
 import { startBeamSyncServer } from "./server.js";
+
+function parseStaticEdgeRelays(raw: string | undefined): EdgeRelayNodeInfo[] {
+  if (!raw?.trim()) return [];
+  // Format: region=https://101.132.x.x:8443|stun:101.132.x.x:3478#sha256=<hex>,...
+  const list: EdgeRelayNodeInfo[] = [];
+  for (const item of raw.split(",")) {
+    const trimmed = item.trim();
+    if (!trimmed) continue;
+    const eqIdx = trimmed.indexOf("=");
+    if (eqIdx <= 0) continue;
+    const region = trimmed.slice(0, eqIdx).trim();
+    const [restBeforeHash, hashFragment] = trimmed.slice(eqIdx + 1).trim().split("#");
+    const [httpUrlRaw, stunUrlRaw] = restBeforeHash.split("|");
+    const httpUrl = httpUrlRaw.trim().replace(/\/+$/, "");
+    const u = new URL(httpUrl);
+    const wsProto = u.protocol === "https:" ? "wss:" : "ws:";
+    const wsUrl = `${wsProto}//${u.host}`;
+    let certSha256: string | undefined;
+    let noSni: boolean | undefined;
+    if (hashFragment) {
+      const params = new URLSearchParams(hashFragment);
+      certSha256 = params.get("sha256")?.trim().toLowerCase() || undefined;
+      if (params.get("nosni") === "1" || params.get("nosni") === "true" || certSha256) {
+        noSni = true;
+      }
+    }
+    list.push({
+      relayId: `static-${region}`,
+      region,
+      httpUrl,
+      wsUrl,
+      stunUrl: stunUrlRaw?.trim() || undefined,
+      certSha256,
+      noSni,
+    });
+  }
+  return list;
+}
 
 async function main(): Promise<void> {
   const port = Number.parseInt(process.env.PORT ?? "8787", 10);
@@ -12,6 +51,8 @@ async function main(): Promise<void> {
     : Number.parseInt(process.env.STUN_PORT ?? "3478", 10);
   const publicStunHost = process.env.PUBLIC_STUN_HOST?.trim() || undefined;
   const apiToken = process.env.BEAMSYNC_API_TOKEN?.trim() || undefined;
+  const relayAuthSecret = process.env.RELAY_AUTH_SECRET?.trim() || undefined;
+  const initialEdgeRelays = parseStaticEdgeRelays(process.env.EDGE_RELAYS);
 
   const r2Bucket = process.env.R2_BUCKET_NAME?.trim();
   const r2AccessKeyId = process.env.R2_ACCESS_KEY_ID?.trim();
@@ -38,6 +79,8 @@ async function main(): Promise<void> {
     dataDir,
     stunPort,
     publicStunHost,
+    relayAuthSecret,
+    initialEdgeRelays,
     apiToken,
     r2,
   });

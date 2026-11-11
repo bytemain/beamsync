@@ -1,17 +1,21 @@
 import {
+  buildSignedEdgeRelayWsUrl,
   bytesToHex,
   evaluateSessionEquilibrium,
+  mintEdgeRelayTicket,
   randomBytes,
   type AllocatedUploadSlot,
   type ClientToServerWsMessage,
   type CreateManagedLeaseResponse,
   type CreatePairingResponse,
+  type EdgeRelayNodeInfo,
   type EndpointCandidate,
   type JoinPairingResponse,
   type PackReceiptRow,
   type ServerToClientWsMessage,
   type SessionMode,
   type SessionState,
+  type SignedEdgeRelayAllocation,
   type TransportTier,
 } from "@beamsync/protocol";
 import type { PackStorageDriver } from "./storageDriver.js";
@@ -46,6 +50,7 @@ interface PeerRuntimeState {
   confirmMacHex?: string;
   hostFingerprint?: string;
   candidates: EndpointCandidate[];
+  relayRttMs?: Record<string, number>;
 }
 
 export interface SessionRuntimeRecord {
@@ -71,9 +76,18 @@ export interface SessionRuntimeRecord {
   ephemeralStorageKeys: Set<string>;
 }
 
+export interface RegisteredEdgeRelay extends EdgeRelayNodeInfo {
+  staticEntry: boolean;
+  lastHeartbeatAt: number;
+  expiresAt: number;
+}
+
 export interface CoordinatorEngineOptions {
   storageDriver: PackStorageDriver;
   stunServers?: string[];
+  relayAuthSecret?: string;
+  initialEdgeRelays?: EdgeRelayNodeInfo[];
+  edgeRelayHeartbeatTtlMs?: number;
   casTtlMs?: number;
   pairingTtlMs?: number;
   sessionTtlMs?: number;
@@ -83,10 +97,13 @@ export interface CoordinatorEngineOptions {
 const DEFAULT_CAS_TTL_MS = 14 * 24 * 60 * 60 * 1000; // 14 days sliding TTL
 const DEFAULT_PAIRING_TTL_MS = 10 * 60 * 1000; // 10 minutes
 const DEFAULT_SESSION_TTL_MS = 2 * 60 * 60 * 1000; // 2 hours
+const DEFAULT_EDGE_RELAY_TTL_MS = 60 * 1000; // 60s dynamic heartbeat TTL
 
 export class CoordinatorEngine {
   readonly storageDriver: PackStorageDriver;
   readonly stunServers: string[];
+  private readonly relayAuthSecret: string;
+  private readonly edgeRelayHeartbeatTtlMs: number;
   private readonly casTtlMs: number;
   private readonly pairingTtlMs: number;
   private readonly sessionTtlMs: number;
@@ -97,14 +114,28 @@ export class CoordinatorEngine {
   private readonly pairingSlots = new Map<string, string>(); // slotCode -> sessionId
   private readonly casPacks = new Map<string, CasPackRecord>(); // `${scope}:${packId}`
   private readonly scopeCasKeys = new Map<string, string>(); // scopeNamespace -> 32B hex
+  private readonly edgeRelays = new Map<string, RegisteredEdgeRelay>(); // relayId -> DERP-like node
 
   constructor(options: CoordinatorEngineOptions) {
     this.storageDriver = options.storageDriver;
     this.stunServers = options.stunServers ?? ["stun:stun.cloudflare.com:3478"];
+    this.relayAuthSecret =
+      options.relayAuthSecret ?? bytesToHex(randomBytes(32));
+    this.edgeRelayHeartbeatTtlMs =
+      options.edgeRelayHeartbeatTtlMs ?? DEFAULT_EDGE_RELAY_TTL_MS;
     this.casTtlMs = options.casTtlMs ?? DEFAULT_CAS_TTL_MS;
     this.pairingTtlMs = options.pairingTtlMs ?? DEFAULT_PAIRING_TTL_MS;
     this.sessionTtlMs = options.sessionTtlMs ?? DEFAULT_SESSION_TTL_MS;
     this.persistence = options.persistence;
+
+    for (const r of options.initialEdgeRelays ?? []) {
+      this.edgeRelays.set(r.relayId, {
+        ...r,
+        staticEntry: true,
+        lastHeartbeatAt: Date.now(),
+        expiresAt: Number.MAX_SAFE_INTEGER,
+      });
+    }
   }
 
   async init(): Promise<void> {
@@ -118,19 +149,158 @@ export class CoordinatorEngine {
     }
   }
 
+  upsertEdgeRelay(node: EdgeRelayNodeInfo, staticEntry = false): void {
+    const now = Date.now();
+    this.edgeRelays.set(node.relayId, {
+      ...node,
+      staticEntry,
+      lastHeartbeatAt: now,
+      expiresAt: staticEntry
+        ? Number.MAX_SAFE_INTEGER
+        : now + this.edgeRelayHeartbeatTtlMs,
+    });
+  }
+
+  listActiveEdgeRelays(): EdgeRelayNodeInfo[] {
+    const now = Date.now();
+    const out: EdgeRelayNodeInfo[] = [];
+    for (const [id, r] of this.edgeRelays) {
+      if (!r.staticEntry && r.expiresAt < now) {
+        this.edgeRelays.delete(id);
+        continue;
+      }
+      out.push({
+        relayId: r.relayId,
+        region: r.region,
+        httpUrl: r.httpUrl,
+        wsUrl: r.wsUrl,
+        stunUrl: r.stunUrl,
+        certSha256: r.certSha256,
+        noSni: r.noSni,
+      });
+    }
+    return out;
+  }
+
+  private getEffectiveStunServers(): string[] {
+    const seen = new Set<string>();
+    const list: string[] = [];
+    for (const r of this.listActiveEdgeRelays()) {
+      if (r.stunUrl && !seen.has(r.stunUrl)) {
+        seen.add(r.stunUrl);
+        list.push(r.stunUrl);
+      }
+    }
+    for (const s of this.stunServers) {
+      if (!seen.has(s)) {
+        seen.add(s);
+        list.push(s);
+      }
+    }
+    return list;
+  }
+
+  private selectOptimalEdgeRelayForSession(
+    sessionId: string,
+    sourceRtt?: Record<string, number>,
+    targetRtt?: Record<string, number>,
+  ): {
+    sourceAlloc: SignedEdgeRelayAllocation;
+    targetAlloc: SignedEdgeRelayAllocation;
+  } | null {
+    const relays = this.listActiveEdgeRelays();
+    if (relays.length === 0) return null;
+
+    // DERP-style minimum joint RTT selection: argmin_r (RTT_source(r) + RTT_target(r))
+    let chosen = relays[0];
+    let bestScore = Number.POSITIVE_INFINITY;
+    for (const r of relays) {
+      const s = sourceRtt?.[r.relayId];
+      const t = targetRtt?.[r.relayId];
+      // Penalize unreachable/unprobed relays slightly so reachable regional relays always win
+      const sCost = typeof s === "number" && Number.isFinite(s) ? s : 2500;
+      const tCost = typeof t === "number" && Number.isFinite(t) ? t : 2500;
+      const score = sCost + tCost;
+      if (score < bestScore) {
+        bestScore = score;
+        chosen = r;
+      }
+    }
+
+    const expiresAtMs = Date.now() + this.sessionTtlMs;
+    const sourceTicket = mintEdgeRelayTicket({
+      authSecret: this.relayAuthSecret,
+      relayId: chosen.relayId,
+      sessionId,
+      role: "source",
+      expiresAtMs,
+    });
+    const targetTicket = mintEdgeRelayTicket({
+      authSecret: this.relayAuthSecret,
+      relayId: chosen.relayId,
+      sessionId,
+      role: "target",
+      expiresAtMs,
+    });
+
+    return {
+      sourceAlloc: {
+        relayId: chosen.relayId,
+        region: chosen.region,
+        httpUrl: chosen.httpUrl,
+        wsRelayUrl: buildSignedEdgeRelayWsUrl({
+          wsBaseUrl: chosen.wsUrl,
+          relayId: chosen.relayId,
+          sessionId,
+          role: "source",
+          expiresAtMs,
+          ticket: sourceTicket,
+        }),
+        stunUrl: chosen.stunUrl,
+        certSha256: chosen.certSha256,
+        noSni: chosen.noSni,
+        ticket: sourceTicket,
+        expiresAtMs,
+      },
+      targetAlloc: {
+        relayId: chosen.relayId,
+        region: chosen.region,
+        httpUrl: chosen.httpUrl,
+        wsRelayUrl: buildSignedEdgeRelayWsUrl({
+          wsBaseUrl: chosen.wsUrl,
+          relayId: chosen.relayId,
+          sessionId,
+          role: "target",
+          expiresAtMs,
+          ticket: targetTicket,
+        }),
+        stunUrl: chosen.stunUrl,
+        certSha256: chosen.certSha256,
+        noSni: chosen.noSni,
+        ticket: targetTicket,
+        expiresAtMs,
+      },
+    };
+  }
+
   getStats(): {
     activeSessions: number;
     activePairingSlots: number;
     casPackCount: number;
+    edgeRelayCount: number;
+    edgeRelays: EdgeRelayNodeInfo[];
     storageMode: string;
     stunServers: string[];
   } {
+    const activeRelays = this.listActiveEdgeRelays();
     return {
       activeSessions: this.sessions.size,
       activePairingSlots: this.pairingSlots.size,
       casPackCount: this.casPacks.size,
+      edgeRelayCount: activeRelays.length,
+      edgeRelays: activeRelays,
       storageMode: this.storageDriver.mode,
-      stunServers: this.stunServers,
+      stunServers: this.getEffectiveStunServers(),
     };
   }
 
@@ -201,7 +371,8 @@ export class CoordinatorEngine {
       slotCode,
       peerToken: sourceToken,
       wsUrl: `${params.wsBaseUrl.replace(/\/+$/, "")}/v1/ws/${sessionId}`,
-      stunServers: this.stunServers,
+      stunServers: this.getEffectiveStunServers(),
+      edgeRelays: this.listActiveEdgeRelays(),
       expiresAt: new Date(expiresAt).toISOString(),
     };
   }
@@ -238,7 +409,8 @@ export class CoordinatorEngine {
       sessionId: session.sessionId,
       peerToken: session.target.token,
       wsUrl: `${params.wsBaseUrl.replace(/\/+$/, "")}/v1/ws/${session.sessionId}`,
-      stunServers: this.stunServers,
+      stunServers: this.getEffectiveStunServers(),
+      edgeRelays: this.listActiveEdgeRelays(),
       expiresAt: new Date(session.expiresAt).toISOString(),
     };
   }
@@ -305,7 +477,8 @@ export class CoordinatorEngine {
       leaseSecretHex,
       scopeCasKeyHex,
       wsUrl: `${params.wsBaseUrl.replace(/\/+$/, "")}/v1/ws/${sessionId}`,
-      stunServers: this.stunServers,
+      stunServers: this.getEffectiveStunServers(),
+      edgeRelays: this.listActiveEdgeRelays(),
       expiresAt: new Date(expiresAt).toISOString(),
     };
   }
@@ -411,6 +584,7 @@ export class CoordinatorEngine {
         me.confirmMacHex = msg.confirmMacHex;
         me.hostFingerprint = msg.hostFingerprint;
         me.candidates = msg.candidates;
+        me.relayRttMs = msg.relayRttMs;
 
         if (session.source.confirmMacHex && session.target.confirmMacHex) {
           const sameHostMatch =
@@ -418,17 +592,25 @@ export class CoordinatorEngine {
             session.source.hostFingerprint === session.target.hostFingerprint;
           session.state = "indexing_diff";
 
+          const relayChoice = this.selectOptimalEdgeRelayForSession(
+            session.sessionId,
+            session.source.relayRttMs,
+            session.target.relayRttMs,
+          );
+
           this.sendToPeer(session.source, {
             type: "peer_confirmed",
             peerConfirmMacHex: session.target.confirmMacHex,
             sameHostMatch,
             peerCandidates: session.target.candidates,
+            selectedEdgeRelay: relayChoice?.sourceAlloc,
           });
           this.sendToPeer(session.target, {
             type: "peer_confirmed",
             peerConfirmMacHex: session.source.confirmMacHex,
             sameHostMatch,
             peerCandidates: session.source.candidates,
+            selectedEdgeRelay: relayChoice?.targetAlloc,
           });
         }
         break;
@@ -454,6 +636,7 @@ export class CoordinatorEngine {
           missingBlobCount: msg.missingBlobCount,
           missingBytesEstimate: msg.missingBytesEstimate,
           selectedTier: msg.selectedTier,
+          selectedEdgeRelayRegion: msg.selectedEdgeRelayRegion,
         });
         break;
       }

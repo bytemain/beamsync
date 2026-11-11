@@ -1,8 +1,13 @@
+import type {
+  EdgeRelayNodeInfo,
+  SignedEdgeRelayAllocation,
+} from "./edgeRelayTicket.js";
 import type { TreeManifest } from "./manifest.js";
 
 export type TransportTier =
   | "LOCAL_IPC"
   | "P2P_DIRECT"
+  | "EDGE_RELAY"
   | "STREAM_RELAY"
   | "R2_PIPELINE";
 
@@ -30,6 +35,7 @@ export interface CreatePairingResponse {
   peerToken: string;
   wsUrl: string;
   stunServers: string[];
+  edgeRelays?: EdgeRelayNodeInfo[];
   expiresAt: string;
 }
 
@@ -38,6 +44,7 @@ export interface JoinPairingResponse {
   peerToken: string;
   wsUrl: string;
   stunServers: string[];
+  edgeRelays?: EdgeRelayNodeInfo[];
   expiresAt: string;
 }
 
@@ -54,6 +61,7 @@ export interface CreateManagedLeaseResponse {
   scopeCasKeyHex: string;
   wsUrl: string;
   stunServers: string[];
+  edgeRelays?: EdgeRelayNodeInfo[];
   expiresAt: string;
 }
 
@@ -83,6 +91,7 @@ export type ClientToServerWsMessage =
       confirmMacHex: string;
       hostFingerprint: string;
       candidates: EndpointCandidate[];
+      relayRttMs?: Record<string, number>;
     }
   | {
       type: "target_have_blobs";
@@ -95,6 +104,7 @@ export type ClientToServerWsMessage =
       missingBlobCount: number;
       missingBytesEstimate: number;
       selectedTier: TransportTier;
+      selectedEdgeRelayRegion?: string;
     }
   | {
       type: "transport_ready";
@@ -157,6 +167,7 @@ export type ServerToClientWsMessage =
       peerConfirmMacHex: string;
       sameHostMatch: boolean;
       peerCandidates: EndpointCandidate[];
+      selectedEdgeRelay?: SignedEdgeRelayAllocation;
     }
   | {
       type: "target_have_blobs";
@@ -169,6 +180,7 @@ export type ServerToClientWsMessage =
       missingBlobCount: number;
       missingBytesEstimate: number;
       selectedTier: TransportTier;
+      selectedEdgeRelayRegion?: string;
     }
   | {
       type: "transport_ready";

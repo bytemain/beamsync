@@ -30,8 +30,8 @@ function printUsage(): void {
   console.log(`BeamSync CLI — streaming incremental directory sync & migration
 
 Usage:
-  beamsync send <source-dir> [--server <url>] [--scope <namespace>] [--code <words>] [--force-tier <tier>]
-  beamsync receive <target-dir> --code <pairing-code> [--server <url>]
+  beamsync send <source-dir> [--server <url>] [--scope <namespace>] [--code <words>] [--prefer-edge-relay] [--disable-edge-relay] [--force-tier <tier>]
+  beamsync receive <target-dir> --code <pairing-code> [--server <url>] [--disable-edge-relay]
   beamsync doctor [--server <url>]
 
 Environment:
@@ -71,6 +71,8 @@ async function main(): Promise<void> {
       sourceDir,
       scopeNamespace,
       customSecretWords: customWords,
+      preferEdgeRelay: Boolean(flags["prefer-edge-relay"]),
+      disableEdgeRelay: Boolean(flags["disable-edge-relay"]),
       forceTier,
       onPairingCode: (code) => {
         console.log(`\nPairing ready. Run on target machine:\n`);
@@ -98,6 +100,7 @@ async function main(): Promise<void> {
       serverUrl,
       targetDir,
       pairingCode: code,
+      disableEdgeRelay: Boolean(flags["disable-edge-relay"]),
     });
 
     console.log(JSON.stringify(result, null, 2));

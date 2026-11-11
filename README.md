@@ -1,141 +1,92 @@
 # BeamSync
 
-面向海量小文件开发工作区与整盘目录迁移的独立流式同步服务与 CLI 基建。
+面向海量小文件开发工作区与整盘目录迁移的独立流式同步服务、DERP 式无状态边缘中继与 CLI 基建。
 
-BeamSync 采用独立的常驻协调中继服务（`beamsync-server`）加客户端 CLI（`beamsync`）架构：需要迁移或单向同步十几 GB 的代码工作区时，两端 CLI 输入同一个配对词组即可自动完成零知识密钥协商、同机 IPC 识别、NAT 打洞直连，或在无法直连时自动切换至 Cloudflare R2 预签名并发边传边下流水线。
+BeamSync 采用中心协调控制面（`beamsync-server`）+ 可水平扩展的无状态边缘中继节点（`beamsync-edge-relay`，对标 Tailscale DERP）+ 客户端 CLI（`beamsync`）架构：需要迁移或单向同步十几 GB 的代码工作区时，两端 CLI 输入同一个配对词组即可自动完成零知识密钥协商、同机 IPC 识别、NAT 打洞直连、就近 DERP 边缘流式直通转发，或在海量数据/节点中断时无缝切换至 Cloudflare R2 预签名并发边传边下流水线。
 
-## 为什么采用独立常驻服务直绑 R2 而不是 Cloudflare Worker
+## 架构设计要点
 
-1. **原生 UDP 能力**：作为类似 Tailscale / croc 的独立同步服务，`beamsync-server` 在单进程内同时承载 HTTP/WebSocket 信令协调器与内置 RFC 5389 UDP STUN 服务（`3478/udp`），可直接辅助两端完成跨网 UDP 打洞；Cloudflare Workers 运行时不支持监听原生 UDP Socket。
-2. **无请求体上限与时长计费束缚**：Cloudflare Workers 在 Free/Pro 计划下存在 100 MB 请求体上限及长连接计费约束，而独立容器/VPS 常驻进程可维持任意时长的控制面 WebSocket 与小增量流式中继（[Cloudflare Workers Limits](https://developers.cloudflare.com/workers/platform/limits/)）。
-3. **直绑 Cloudflare R2 依然零服务端带宽开销**：绑定 R2 并不需要把服务端跑在 Worker 里。`beamsync-server` 通过内置纯内存 AWS SigV4 签名器离线签发 `https://<accountId>.r2.cloudflarestorage.com` 的预签名 `PUT`/`GET` URL（[Cloudflare R2 Presigned URLs](https://developers.cloudflare.com/r2/api/s3/presigned-urls/)），大体积加密 Pack 数据流由两端 CLI 直接并发读写 R2，既享受 R2 零公网下行流量费，又无需经过控制面服务器中转。
+1. **为什么中心服务直绑 R2 而不是跑在 Cloudflare Worker 里**
+   - `beamsync-server` 与 `beamsync-edge-relay` 在单进程内同时承载 HTTP/WebSocket 与内置 RFC 5389 UDP STUN（`3478/udp`），可直接辅助两端完成跨网 UDP 打洞；Cloudflare Workers 运行时不支持绑定原生 UDP Socket，且在 Free/Pro 计划下受请求体与长连接计费限制（[Cloudflare Workers Limits](https://developers.cloudflare.com/workers/platform/limits/)）。
+   - 绑定 R2 无需跑在 Worker 内：`beamsync-server` 通过纯内存 AWS SigV4 离线签发 `https://<accountId>.r2.cloudflarestorage.com` 的预签名 `PUT`/`GET` URL（[Cloudflare R2 Presigned URLs](https://developers.cloudflare.com/r2/api/s3/presigned-urls/)），大体积 Pack 由客户端直连 R2 并发读写，兼具零公网下行流量费与零控制面带宽占用。
+2. **对标 Tailscale DERP 的无状态多地域 Edge Relay（支持上海等境内云主机 `IP + 自签名 TLS` 免域名免备案直连）**
+   - **纯无状态盲转发**：`beamsync-edge-relay` 不持有任何 R2 密钥、数据库或会话明文密钥，仅凭共享 `RELAY_AUTH_SECRET` 校验短期 HMAC 票据并在内存中拼合 `source`/`target` 二进制加密流（含 `4 MiB` 水位背压控制）。
+   - **免域名免备案（`IP + 自签名 TLS + SHA-256 证书指纹锁定 + 零 SNI`）**：在上海、北京、深圳等境内云主机部署时，无需绑定域名、无需申请 CA 证书、无需 ICP 备案。节点启动时通过纯 Node `node:crypto` 自动生成 ECDSA P-256 自签名 X.509 证书并计算 `certSha256`，通过签名心跳上报至中心服务 RelayMap（类似 Tailscale DERPMap 的 `CertName: sha256-raw:...`）。客户端探活与建立 `wss://<IP>:<Port>` 时自动抹除 TLS `ClientHello` 中的 `SNI` 扩展（避免触发云厂商未备案域名阻断墙），并在握手首包严格校验对端证书 `SHA-256` 指纹与端到端 `K_transport` 双向挑战认证。
+   - **双端最低联合 RTT 选路 + 中断自动回退 R2**：两端并行测量 RelayMap 中各地域节点（如 `sha`、`hkg`、`sgp`、`tyo`）的 RTT，中心服务自动分配 `RTT_source + RTT_target` 最低的边缘节点；若传输中途边缘节点断连，仅对未确认的剩余 Pack 自动无缝切换至 `R2_PIPELINE`。
 
-## 核心特性
+## 五级自适应传输路径
 
-- **四级自适应传输路径（Happy Eyeballs 自动协商与无缝降级）**
-  - **Tier 0 `LOCAL_IPC`**：基于配对密钥派生的主机指纹自动识别同机（含同机跨 Linux/macOS 用户），通过 `0666` Unix Domain Socket + 双向 `K_transport` HMAC 挑战应答零压缩高速直传，0 次 R2 请求。
-  - **Tier 1 `P2P_DIRECT`**：局域网/Tailscale TCP 直连与内置 STUN + 双向 UDP 打洞直连（`BMU1` 滑动窗口加密传输），直连中断时仅对未确认的剩余 Pack 自动无缝降级至 `R2_PIPELINE`。
-  - **Tier 2 `STREAM_RELAY`**：小体积增量（默认 `<= 8 MiB`）且无法直连时，直接通过 WebSocket 控制面加密分片流式推送，省去对象存储往返延迟。
-  - **Tier 3 `R2_PIPELINE`**：源端每上传完一个 `~8 MiB` 加密 Pack 立即上报 `sourceReceiptAt`，服务端即刻向目标端推送预签名 `GET` URL 并发拉取解包并回执 `targetReceiptAt`；双边回执达到平衡态后原子目录交换提交。
-- **针对数万小代码文件与大文件混合目录优化**
-  - 本地持久化增量状态索引（`(size, mtimeMs, ino)` 命中免重算哈希）+ BLAKE3 整文件寻址（`<= 256 KiB`）+ FastCDC 内容定义分块（`> 256 KiB`）。
-  - 小文件流式聚合为 `BMSP` 二进制 Pack 容器（`zstd` 压缩 + `XChaCha20-Poly1305` / ChaCha20-Poly1305 端到端加密），把 50,000 次文件系统与网络元数据开销收敛为数百个高吞吐并发流。
-  - 托管命名空间（`scopeNamespace`）支持 SIV 收敛加密的持久化 R2 CAS 去重，跨机器重复同步相同内容无需重复上传。
+- **Tier 0 `LOCAL_IPC`**：同机（含同机不同 Linux/macOS 用户）通过 `0666` Unix Domain Socket + 双向 `K_transport` HMAC 挑战认证零压缩直传，0 次外部网络请求。
+- **Tier 1 `P2P_DIRECT`**：局域网/Tailscale TCP 直连与内置 STUN + 双向 UDP 打洞直连（`BMU1` 滑动窗口加密传输）。
+- **Tier 2 `EDGE_RELAY`（DERP 模式）**：对称型 NAT 或企业防火墙封锁 UDP 时，通过就近无状态边缘节点（支持 `wss://<IP>:<Port>` 免备案自签名证书指纹锁定）二进制流式直通转发 `BMSP` 加密压缩包，0 次对象存储写入。
+- **Tier 3 `STREAM_RELAY`**：未部署独立边缘节点且增量极小（默认 `<= 8 MiB`）时，直接复用控制面信令通道推送。
+- **Tier 4 `R2_PIPELINE`**：超大体积或跨洋异步传输时，源端并发上传 `~8 MiB` 加密 Pack 并上报 `sourceReceiptAt`，目标端即刻并发拉取解包并上报 `targetReceiptAt`，双边回执平衡后原子目录交换提交；托管命名空间（`scopeNamespace`）支持 SIV 收敛加密的跨机器 R2 CAS 去重。
 
 ## 仓库结构
 
-- `packages/protocol`：X25519 EKE PAKE 密钥交换、FastCDC 分块、`BMSP` 加密压缩 Pack 容器、目录树清单与忽略规则、离线 R2 SigV4 预签名器、双边回执平衡态判定。
-- `packages/coordinator`：配对会话槽位管理、四级路径状态机、R2 CAS 去重索引与边传边下双边回执引擎。
-- `packages/server`：独立常驻服务端（HTTP REST + WebSocket 信令与流式中继 + 内置 UDP `:3478` STUN 服务 + 本地 WAL 持久化索引）。
-- `packages/cli`：`beamsync` 命令行客户端（本地增量索引、同机 Unix Socket / LAN TCP / STUN UDP 打洞、并发 R2 流水线、硬链接预填充与原子暂存区提交）。
+- `packages/protocol`：X25519 EKE PAKE 密钥交换、FastCDC 分块、`BMSP` 加密压缩 Pack 容器、DERP 票据与心跳签名、离线 R2 SigV4 预签名器。
+- `packages/coordinator`：配对槽位管理、DERP RelayMap 注册表与最低 RTT 选路、R2 CAS 去重索引、双边回执平衡态状态机。
+- `packages/server`：中心协调服务 `beamsync-server`（REST + WebSocket + 内置 STUN + 本地 WAL 持久化 + R2 预签名绑定）。
+- `packages/edge-relay`：无状态边缘中继服务 `beamsync-edge-relay`（内置纯 `node:crypto` 自签名 X.509 证书生成器、免域名无 SNI `WSS` 二进制流交换、内置 UDP `:3478` STUN、自动心跳注册）。
+- `packages/cli`：`beamsync` 命令行客户端（本地增量索引、五级路径协商、TLS 证书指纹锁定无 SNI 客户端、原子暂存区提交）。
 
-## 服务端一键部署方案
+## 服务端与边缘节点部署
 
-服务端无外部 Postgres / Redis 依赖，仅需绑定一个 Cloudflare R2 Bucket 即可上线运行。
-
-### 方案一：Docker Compose 部署（推荐，任意云服务器 / 自有节点 1 分钟启动）
-
-1. 复制环境变量模板并填入 Cloudflare R2 S3 API 凭证：
+### 1. 部署中心协调服务 `beamsync-server`（绑定 R2）
 
 ```bash
 cp .env.example .env
-```
-
-`.env` 关键配置：
-
-```ini
-PUBLIC_URL=https://sync.yourdomain.com
-PUBLIC_STUN_HOST=sync.yourdomain.com
-PORT=8787
-STUN_PORT=3478
-
-R2_ACCOUNT_ID=你的_cloudflare_account_id
-R2_BUCKET_NAME=beamsync-packs
-R2_ACCESS_KEY_ID=你的_r2_access_key_id
-R2_SECRET_ACCESS_KEY=你的_r2_secret_access_key
-```
-
-2. 一键构建并后台启动（同时暴露 `8787/tcp` 与 `3478/udp`）：
-
-```bash
+# 编辑 .env 填入 PUBLIC_URL、RELAY_AUTH_SECRET 与 R2 凭证
 docker compose up -d --build
 curl http://127.0.0.1:8787/healthz
 ```
 
-3. 一键配置 R2 Bucket 生命周期自动清理兜底规则（临时前缀 `ephemeral/v1/` 24 小时过期，`cas/v1/` 30 天上限过期）：
+可选配置 R2 Bucket 生命周期兜底清理规则：
 
 ```bash
-CF_API_TOKEN=你的_cf_api_token \
-R2_ACCOUNT_ID=你的_cloudflare_account_id \
-R2_BUCKET_NAME=beamsync-packs \
-npm run setup:r2-lifecycle
+CF_API_TOKEN=... R2_ACCOUNT_ID=... R2_BUCKET_NAME=beamsync-packs npm run setup:r2-lifecycle
 ```
 
-### 方案二：Linux 裸机 systemd 一键安装
+### 2. 部署上海 / 多地域免备案 DERP 边缘节点 `beamsync-edge-relay`
 
-在 Debian / Ubuntu / RHEL 主机上直接执行：
+在任意带有公网 IP 的云主机（例如上海轻量云/ECS，假设公网 IP 为 `101.132.x.x`，无需域名与 ICP 备案，只需在安全组放行自定义 TCP 端口如 `8443/tcp` 与 `3478/udp`）执行：
 
 ```bash
-sudo ./deploy/install-vps.sh
-sudo vim /etc/beamsync/beamsync.env
-sudo systemctl restart beamsync
+REGION=sha \
+PUBLIC_IP=101.132.x.x \
+PORT=8443 \
+TLS_MODE=self-signed \
+COORDINATOR_URL=https://sync.yourdomain.com \
+RELAY_AUTH_SECRET=与中心服务一致的密钥 \
+docker compose -f docker-compose.edge-relay.yml up -d --build
 ```
 
-### 方案三：Fly.io / Railway 容器托管平台
+节点启动后会自动生成并持久化自签名 TLS 证书，每 15 秒通过签名心跳将 `wss://101.132.x.x:8443`、`stun:101.132.x.x:3478` 与 `certSha256` 自动注册进中心服务的 RelayMap，无需重启中心服务。你也可以在新加坡（`REGION=sgp`）、东京（`REGION=tyo`）等任意节点用同一命令随时横向扩容。
 
-仓库根目录已内置 `fly.toml`（含持久化挂载卷与 `8787/tcp` + `3478/udp` 双端口映射）与 `railway.json`：
+如果不希望节点主动心跳，也可以在中心服务的 `.env` 中通过 `EDGE_RELAYS` 静态配置节点启动日志打印出的 `staticEdgeRelayConfigHint`：
 
-```bash
-fly volumes create beamsync_data --region sin --size 1
-fly secrets set PUBLIC_URL=https://beamsync-server.fly.dev PUBLIC_STUN_HOST=beamsync-server.fly.dev R2_ACCOUNT_ID=... R2_BUCKET_NAME=... R2_ACCESS_KEY_ID=... R2_SECRET_ACCESS_KEY=...
-fly deploy
+```ini
+EDGE_RELAYS=sha=https://101.132.x.x:8443|stun:101.132.x.x:3478#sha256=<节点日志输出的64位指纹>
 ```
 
 ## 客户端 CLI 使用指南
 
-编译并链接 CLI：
-
 ```bash
-npm install
-npm run build
-```
-
-### 1. 自动生成一次性配对词组
-
-源机器执行：
-
-```bash
+npm install && npm run build
 export BEAMSYNC_SERVER_URL=https://sync.yourdomain.com
-npx beamsync send /path/to/devbox-workspace
-# 输出示例：101-amber-falcon-river
-```
 
-目标机器执行：
-
-```bash
-export BEAMSYNC_SERVER_URL=https://sync.yourdomain.com
-npx beamsync receive /path/to/devbox-workspace --code 101-amber-falcon-river
-```
-
-### 2. 两端共同输入自定义秘钥或词组（先后顺序任意）
-
-两端无需拷贝槽位号，直接约定任意词组即可通过盲化槽位与零知识 PAKE 自动汇合（包括同机不同用户目录直传）：
-
-```bash
-# 机器 A（或同机用户 A）
+# 两端输入相同自定义词组即可自动完成同机 / P2P / 就近上海 DERP / R2 同步
 npx beamsync send ~/workspace --code "tiger bamboo 2026"
-
-# 机器 B（或同机用户 B，即使先回车等待也可自动汇合）
 npx beamsync receive ~/workspace --code "tiger bamboo 2026"
-```
 
-### 3. 环境与连通性自检
+# 强制优先走 DERP 边缘直通（不设 512 MiB 体积阈值上限）
+npx beamsync send ~/workspace --code "tiger bamboo 2026" --prefer-edge-relay
 
-```bash
+# 类似 tailscale netcheck：检测 STUN 反射地址与所有在线 DERP 边缘节点的 RTT
 npx beamsync doctor --server https://sync.yourdomain.com
 ```
 
-## 本地构建与端到端测试
+## 本地构建与测试
 
 ```bash
 npm run typecheck
