@@ -85,13 +85,31 @@ export class FramedSocketChannel {
     ]);
 
     await new Promise<void>((resolve, reject) => {
-      const canContinue = this.socket.write(packet, (err) => {
+      // Listeners are removed as soon as the write settles: a long transfer waits for
+      // "drain" on almost every pack and must not pile up one listener per wait
+      let waitingForDrain = false;
+      const settle = (err?: Error | null) => {
+        if (waitingForDrain) {
+          this.socket.removeListener("drain", onDrain);
+          this.socket.removeListener("error", onError);
+          this.socket.removeListener("close", onClose);
+          waitingForDrain = false;
+        }
         if (err) reject(err);
-        else if (canContinue) resolve();
+        else resolve();
+      };
+      const onDrain = () => settle();
+      const onError = (err: Error) => settle(err);
+      const onClose = () => settle(this.closedError ?? new Error("FramedSocketChannel closed"));
+      const canContinue = this.socket.write(packet, (err) => {
+        if (err) settle(err);
+        else if (canContinue) settle();
       });
       if (!canContinue) {
-        this.socket.once("drain", () => resolve());
-        this.socket.once("error", reject);
+        waitingForDrain = true;
+        this.socket.once("drain", onDrain);
+        this.socket.once("error", onError);
+        this.socket.once("close", onClose);
       }
     });
   }

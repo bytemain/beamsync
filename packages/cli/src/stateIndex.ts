@@ -1,6 +1,7 @@
 import {
   lstat,
   mkdir,
+  open,
   readdir,
   readFile,
   readlink,
@@ -15,10 +16,11 @@ import {
   canonicalizeManifest,
   computeRootTreeDigest,
   DEFAULT_SMALL_FILE_THRESHOLD_BYTES,
-  fastCdcChunk,
+  FastCdcStreamChunker,
   LayeredIgnoreMatcher,
   utf8Bytes,
   validateRelativeSymlinkTarget,
+  type ContentChunkRef,
   type FastCdcOptions,
   type FileChunkRef,
   type IgnoreDecision,
@@ -72,6 +74,45 @@ export interface ScanWorkspaceOptions extends IgnoreOptions {
   cdcOptions?: FastCdcOptions;
   /** Stops the walk before the next entry; the scan then rejects with `SCAN_ABORTED`. */
   signal?: AbortSignal;
+  /** How much of a large file is read per call while it is chunked (default 4 MiB). */
+  readBlockBytes?: number;
+}
+
+export const DEFAULT_SCAN_READ_BLOCK_BYTES = 4 * 1024 * 1024;
+
+/**
+ * Splits a file into content-defined chunks while reading it block by block, so memory use
+ * does not depend on the file size. Reads up to the end of the file as it is at that moment.
+ */
+export async function chunkFileStreaming(
+  absPath: string,
+  options: {
+    cdcOptions?: FastCdcOptions;
+    readBlockBytes?: number;
+    signal?: AbortSignal;
+  } = {},
+): Promise<ContentChunkRef[]> {
+  const blockBytes = Math.max(1, options.readBlockBytes ?? DEFAULT_SCAN_READ_BLOCK_BYTES);
+  const chunker = new FastCdcStreamChunker(options.cdcOptions);
+  const chunks: ContentChunkRef[] = [];
+  const block = Buffer.allocUnsafe(blockBytes);
+  const fh = await open(absPath, "r");
+  try {
+    let position = 0;
+    for (;;) {
+      if (options.signal?.aborted) {
+        throw new Error("SCAN_ABORTED: Workspace scan was cancelled");
+      }
+      const { bytesRead } = await fh.read(block, 0, blockBytes, position);
+      if (bytesRead === 0) break;
+      position += bytesRead;
+      for (const c of chunker.push(block.subarray(0, bytesRead))) chunks.push(c);
+    }
+    for (const c of chunker.finish()) chunks.push(c);
+  } finally {
+    await fh.close();
+  }
+  return chunks;
 }
 
 export interface ScanWorkspaceResult {
@@ -397,11 +438,10 @@ export async function scanWorkspace(
 
         // Read & hash new or modified file
         hashedFiles++;
-        const buf = await readFile(childAbs);
-        const u8 = new Uint8Array(buf.buffer, buf.byteOffset, buf.byteLength);
 
         if (size <= smallThreshold) {
-          const blobHash = blake3Hex(u8);
+          const buf = await readFile(childAbs);
+          const blobHash = blake3Hex(new Uint8Array(buf.buffer, buf.byteOffset, buf.byteLength));
           if (!blobSlices.has(blobHash)) {
             blobSlices.set(blobHash, {
               absPath: childAbs,
@@ -421,7 +461,12 @@ export async function scanWorkspace(
             hardlinkGroupId,
           });
         } else {
-          const cdcChunks = fastCdcChunk(u8, options.cdcOptions);
+          // Never held in memory as a whole: a workspace can contain files of many GiB
+          const cdcChunks = await chunkFileStreaming(childAbs, {
+            cdcOptions: options.cdcOptions,
+            readBlockBytes: options.readBlockBytes,
+            signal: options.signal,
+          });
           const chunkRefs: FileChunkRef[] = cdcChunks.map((c) => {
             if (!blobSlices.has(c.hash)) {
               blobSlices.set(c.hash, {
