@@ -40,6 +40,16 @@ function parseStaticEdgeRelays(raw: string | undefined): EdgeRelayNodeInfo[] {
   return list;
 }
 
+function parsePositiveInt(name: string): number | undefined {
+  const raw = process.env[name]?.trim();
+  if (!raw) return undefined;
+  const value = Number(raw);
+  if (!Number.isInteger(value) || value <= 0) {
+    throw new Error(`${name} must be a positive integer, got "${raw}"`);
+  }
+  return value;
+}
+
 async function main(): Promise<void> {
   const port = Number.parseInt(process.env.PORT ?? "8787", 10);
   const host = process.env.HOST ?? "0.0.0.0";
@@ -52,6 +62,8 @@ async function main(): Promise<void> {
   const publicStunHost = process.env.PUBLIC_STUN_HOST?.trim() || undefined;
   const apiToken = process.env.BEAMSYNC_API_TOKEN?.trim() || undefined;
   const relayAuthSecret = process.env.RELAY_AUTH_SECRET?.trim() || undefined;
+  const maxSessions = parsePositiveInt("MAX_SESSIONS");
+  const maxReplayBufferMb = parsePositiveInt("MAX_REPLAY_BUFFER_MB");
   const initialEdgeRelays = parseStaticEdgeRelays(process.env.EDGE_RELAYS);
 
   const r2Bucket = process.env.R2_BUCKET_NAME?.trim();
@@ -82,6 +94,9 @@ async function main(): Promise<void> {
     relayAuthSecret,
     initialEdgeRelays,
     apiToken,
+    maxSessions,
+    maxReplayLogBytesTotal:
+      maxReplayBufferMb === undefined ? undefined : maxReplayBufferMb * 1024 * 1024,
     r2,
   });
 
@@ -94,6 +109,7 @@ async function main(): Promise<void> {
       stunUrl: running.stunUrl,
       storageMode: r2 ? "r2-presigned" : "builtin-http",
       dataDir,
+      pairingAuth: apiToken ? "api-token" : "open",
     }),
   );
 

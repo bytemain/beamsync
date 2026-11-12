@@ -4,7 +4,7 @@ import http from "node:http";
 import https from "node:https";
 import net from "node:net";
 import type tls from "node:tls";
-import { WebSocketServer, WebSocket } from "ws";
+import type { Duplex } from "node:stream";
 import {
   signEdgeRelayHeartbeat,
   verifyEdgeRelayTicket,
@@ -15,6 +15,7 @@ import {
   computeCertPemSha256,
   getOrCreateSelfSignedTlsMaterial,
 } from "./selfSignedTls.js";
+import { acceptWebSocketUpgrade, WsStreamConnection } from "./wsStream.js";
 
 const STUN_MAGIC_COOKIE = 0x2112a442;
 const STUN_BINDING_REQUEST = 0x0001;
@@ -22,13 +23,19 @@ const STUN_BINDING_SUCCESS_RESPONSE = 0x0101;
 const STUN_ATTR_XOR_MAPPED_ADDRESS = 0x0020;
 
 const RELAY_PAIRED_SIGNAL = Buffer.from([0x01]);
-const HIGH_WATERMARK_BYTES = 4 * 1024 * 1024;
-const LOW_WATERMARK_BYTES = 1 * 1024 * 1024;
+/** Largest relayed message. Peers send packs of at most ~8 MiB plus framing. */
+const MAX_RELAY_MESSAGE_BYTES = 32 * 1024 * 1024;
+/**
+ * A sender is paused once this many bytes are queued towards its peer and resumed when the
+ * queue is flushed. Together with fragment-wise forwarding this bounds relay memory per
+ * transfer to roughly this value per direction, independent of the message size.
+ */
+const DEFAULT_FORWARD_HIGH_WATERMARK_BYTES = 1 * 1024 * 1024;
 
 interface RelayRoom {
   sessionId: string;
-  source: WebSocket | null;
-  target: WebSocket | null;
+  source: WsStreamConnection | null;
+  target: WsStreamConnection | null;
   pairedNotified: boolean;
   createdAt: number;
   bytesForwarded: number;
@@ -59,6 +66,8 @@ export interface EdgeRelayServerConfig {
   coordinatorUrl?: string; // Optional central coordinator URL for auto-registration heartbeats
   heartbeatIntervalMs?: number;
   probeDelayMs?: number; // Test hook to simulate regional network latency
+  /** Queued bytes towards a slow peer before its sender is paused (default 1 MiB). */
+  forwardHighWatermarkBytes?: number;
 }
 
 export interface RunningEdgeRelayServer {
@@ -249,7 +258,9 @@ export async function startEdgeRelayServer(
     });
   }
 
-  const wss = new WebSocketServer({ noServer: true, maxPayload: 32 * 1024 * 1024 });
+  const forwardHighWatermark =
+    config.forwardHighWatermarkBytes ?? DEFAULT_FORWARD_HIGH_WATERMARK_BYTES;
+  const upgradedSockets = new Set<Duplex>();
 
   server.on("upgrade", (req, socket, head) => {
     const reqUrl = new URL(
@@ -286,15 +297,19 @@ export async function startEdgeRelayServer(
       return;
     }
 
-    wss.handleUpgrade(req, socket, head, (ws) => {
-      attachRelayPeer(sessionId, role, ws);
-    });
+    if (!acceptWebSocketUpgrade(req, socket)) {
+      return;
+    }
+    upgradedSockets.add(socket);
+    socket.once("close", () => upgradedSockets.delete(socket));
+    attachRelayPeer(sessionId, role, socket, head);
   });
 
   function attachRelayPeer(
     sessionId: string,
     role: "source" | "target",
-    ws: WebSocket,
+    socket: Duplex,
+    head: Buffer,
   ): void {
     let room = rooms.get(sessionId);
     if (!room) {
@@ -308,86 +323,117 @@ export async function startEdgeRelayServer(
       };
       rooms.set(sessionId, room);
     }
+    const activeRoom = room;
 
-    if (role === "source") {
-      if (room.source) room.pairedNotified = false;
-      room.source?.close(1000, "replaced");
-      room.source = ws;
-    } else {
-      if (room.target) room.pairedNotified = false;
-      room.target?.close(1000, "replaced");
-      room.target = ws;
-    }
-
-    const rawSock = (ws as unknown as { _socket?: net.Socket })._socket;
-    rawSock?.setNoDelay?.(true);
-
-    const getPeer = (): WebSocket | null => {
+    const getPeer = (): WsStreamConnection | null => {
       const current = rooms.get(sessionId);
       if (!current) return null;
       return role === "source" ? current.target : current.source;
     };
 
-    ws.on("message", (data, isBinary) => {
-      const peer = getPeer();
-      if (!peer || peer.readyState !== WebSocket.OPEN) return;
+    // Destination of the message that is currently arriving. It is fixed at the first
+    // fragment: a message is forwarded to one peer completely or not at all.
+    let forwardDest: WsStreamConnection | null = null;
+    let forwardStarted = false;
+    let pausedForPeer = false;
 
-      const buf = Buffer.isBuffer(data)
-        ? data
-        : Array.isArray(data)
-          ? Buffer.concat(data)
-          : Buffer.from(data);
-
-      totalRelayedBytes += buf.byteLength;
-      totalRelayedFrames += 1;
-      room!.bytesForwarded += buf.byteLength;
-
-      if (peer.bufferedAmount > HIGH_WATERMARK_BYTES && rawSock) {
-        rawSock.pause();
-        const checkDrain = setInterval(() => {
-          if (
-            peer.readyState !== WebSocket.OPEN ||
-            peer.bufferedAmount < LOW_WATERMARK_BYTES
-          ) {
-            clearInterval(checkDrain);
-            rawSock.resume();
+    const conn: WsStreamConnection = new WsStreamConnection(
+      socket,
+      Buffer.alloc(0),
+      {
+        onFragment: (payload, first, fin, opcode) => {
+          if (first) {
+            const peer = getPeer();
+            forwardDest = peer && peer.isOpen ? peer : null;
+            forwardStarted = false;
           }
-        }, 10);
-      }
+          const dest = forwardDest;
+          if (fin) {
+            forwardDest = null;
+          }
+          if (!dest || !dest.isOpen || dest !== getPeer()) {
+            // No peer yet, or the peer changed mid-message: drop the rest of this message.
+            forwardDest = null;
+            return;
+          }
 
-      peer.send(buf, { binary: isBinary });
-    });
+          totalRelayedBytes += payload.length;
+          activeRoom.bytesForwarded += payload.length;
+          if (fin) {
+            totalRelayedFrames += 1;
+          }
+          dest.writeFragment(payload, opcode, !forwardStarted, fin);
+          forwardStarted = true;
 
-    const cleanup = () => {
-      const current = rooms.get(sessionId);
-      if (!current) return;
-      if (role === "source" && current.source === ws) {
-        current.source = null;
-        if (current.target?.readyState === WebSocket.OPEN) {
-          current.target.close(1001, "source_disconnected");
+          if (!pausedForPeer && dest.bufferedBytes > forwardHighWatermark) {
+            const resume = () => {
+              pausedForPeer = false;
+              if (conn.isOpen) {
+                conn.resumeReading();
+              }
+            };
+            if (dest.onceDrained(resume)) {
+              pausedForPeer = true;
+              conn.pauseReading();
+            }
+          }
+        },
+        onClose: () => {
+          const current = rooms.get(sessionId);
+          if (!current) return;
+          if (role === "source" && current.source === conn) {
+            current.source = null;
+            current.target?.close(1001, "source_disconnected");
+          } else if (role === "target" && current.target === conn) {
+            current.target = null;
+            current.source?.close(1001, "target_disconnected");
+          }
+          if (!current.source && !current.target) {
+            rooms.delete(sessionId);
+          }
+        },
+      },
+      { maxMessageBytes: MAX_RELAY_MESSAGE_BYTES },
+    );
+
+    const previous = role === "source" ? room.source : room.target;
+    if (role === "source") {
+      room.source = conn;
+    } else {
+      room.target = conn;
+    }
+    if (previous) {
+      room.pairedNotified = false;
+      previous.close(1000, "replaced");
+      // The other side may have received only part of a message from the replaced peer.
+      // A WebSocket message cannot be abandoned halfway, so that connection has to go too.
+      const other = role === "source" ? room.target : room.source;
+      if (other?.hasUnfinishedOutboundMessage) {
+        if (role === "source") {
+          room.target = null;
+        } else {
+          room.source = null;
         }
-      } else if (role === "target" && current.target === ws) {
-        current.target = null;
-        if (current.source?.readyState === WebSocket.OPEN) {
-          current.source.close(1001, "target_disconnected");
-        }
+        other.close(1001, "peer_replaced_mid_message");
       }
-      if (!current.source && !current.target) {
-        rooms.delete(sessionId);
-      }
-    };
-
-    ws.on("close", cleanup);
-    ws.on("error", cleanup);
+    }
 
     if (
-      room.source?.readyState === WebSocket.OPEN &&
-      room.target?.readyState === WebSocket.OPEN &&
-      !room.pairedNotified
+      room.source?.isOpen &&
+      room.target?.isOpen &&
+      !room.pairedNotified &&
+      !room.source.hasUnfinishedOutboundMessage &&
+      !room.target.hasUnfinishedOutboundMessage
     ) {
       room.pairedNotified = true;
-      room.source.send(RELAY_PAIRED_SIGNAL, { binary: true });
-      room.target.send(RELAY_PAIRED_SIGNAL, { binary: true });
+      room.source.sendBinaryMessage(RELAY_PAIRED_SIGNAL);
+      room.target.sendBinaryMessage(RELAY_PAIRED_SIGNAL);
+    }
+
+    // Bytes that arrived together with the upgrade request are processed only now, after the
+    // room is set up, so a message sent right behind the handshake is not lost.
+    if (head.length > 0) {
+      socket.unshift(head);
     }
   }
 
@@ -431,12 +477,8 @@ export async function startEdgeRelayServer(
 
   const wsPingTimer = setInterval(() => {
     for (const room of rooms.values()) {
-      if (room.source?.readyState === WebSocket.OPEN) {
-        room.source.ping();
-      }
-      if (room.target?.readyState === WebSocket.OPEN) {
-        room.target.ping();
-      }
+      room.source?.ping();
+      room.target?.ping();
     }
   }, 20_000);
   wsPingTimer.unref();
@@ -515,7 +557,9 @@ export async function startEdgeRelayServer(
         room.target?.terminate();
       }
       rooms.clear();
-      await new Promise<void>((r) => wss.close(() => r()));
+      for (const socket of upgradedSockets) {
+        socket.destroy();
+      }
       await new Promise<void>((r) => server.close(() => r()));
       if (stun) await stun.close();
     },

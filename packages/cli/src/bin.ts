@@ -32,11 +32,13 @@ Receive options:
   --delete-ignored         Delete target paths the sender ignored (default: keep them)
 
 Options for both sides:
+  --api-token <token>      Bearer token, for servers that require one to pair
   --disable-edge-relay     Never use an Edge Relay
   --no-port-mapping        Do not ask the local gateway for a UDP port mapping (NAT-PMP)
 
 Environment:
   BEAMSYNC_SERVER_URL   Default coordinator server URL (default: http://127.0.0.1:8787)
+  BEAMSYNC_API_TOKEN    Bearer token for servers that require one to pair (same as --api-token)
   BEAMSYNC_PROXY        Outbound proxy (http://, https://, socks5://); overrides HTTPS_PROXY / HTTP_PROXY / ALL_PROXY
   BEAMSYNC_NO_PROXY     Hosts that bypass the proxy (same syntax as NO_PROXY)
   BEAMSYNC_IGNORE_FILES Comma-separated extra ignore file names (same as repeating --ignore-file)
@@ -50,6 +52,9 @@ async function main(): Promise<void> {
     (typeof flags.server === "string" ? flags.server : undefined) ??
     process.env.BEAMSYNC_SERVER_URL ??
     "http://127.0.0.1:8787";
+  const apiToken =
+    (typeof flags["api-token"] === "string" ? flags["api-token"] : undefined) ??
+    (process.env.BEAMSYNC_API_TOKEN?.trim() || undefined);
 
   if (!cmd || flags.help || cmd === "help") {
     printUsage();
@@ -76,6 +81,7 @@ async function main(): Promise<void> {
 
     const result = await sendDirectory({
       serverUrl,
+      apiToken,
       sourceDir,
       scopeNamespace,
       customSecretWords: customWords,
@@ -111,6 +117,7 @@ async function main(): Promise<void> {
 
     const result = await receiveDirectory({
       serverUrl,
+      apiToken,
       targetDir,
       pairingCode: code,
       deleteIgnored: Boolean(flags["delete-ignored"]),

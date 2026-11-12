@@ -26,6 +26,10 @@ import type { PackStorageDriver } from "./storageDriver.js";
 export interface PeerSocketHandle {
   send(jsonMessage: string): void;
   close(code?: number, reason?: string): void;
+  /** Bytes accepted by `send` that have not been written to the network yet. */
+  bufferedAmount?(): number;
+  /** Drops the connection immediately, discarding queued bytes. */
+  terminate?(): void;
 }
 
 export interface CasPackRecord {
@@ -71,6 +75,17 @@ interface PeerRuntimeState {
 
 /** Upper bound of buffered un-acked signaling bytes per peer before old entries are evicted. */
 const MAX_PEER_REPLAY_LOG_BYTES = 64 * 1024 * 1024;
+/**
+ * A signaling socket with more than this queued is closed as a slow consumer; the peer can
+ * resume from its replay log. Above the per-peer replay cap so a full replay still fits.
+ */
+const DEFAULT_MAX_SOCKET_BUFFERED_BYTES = MAX_PEER_REPLAY_LOG_BYTES + 16 * 1024 * 1024;
+const DEFAULT_MAX_SESSIONS = 5000;
+const DEFAULT_MAX_REPLAY_LOG_BYTES_TOTAL = 512 * 1024 * 1024;
+/** After an over-budget eviction the total is brought down to this share of the budget. */
+const REPLAY_BUDGET_LOW_WATER_RATIO = 0.9;
+/** How long a committed or failed session is kept so a reconnecting peer can still read its outcome. */
+const DEFAULT_FINISHED_SESSION_LINGER_MS = 10 * 60 * 1000;
 
 export interface SessionRuntimeRecord {
   sessionId: string;
@@ -116,6 +131,21 @@ export interface CoordinatorEngineOptions {
    */
   peerLossGraceMs?: number;
   persistence?: CoordinatorPersistenceHook;
+  /**
+   * Sessions held at once, pending pairings included. Creating one beyond this fails with
+   * `SERVER_BUSY`. Default 5000.
+   */
+  maxSessions?: number;
+  /**
+   * Total size of un-acknowledged messages kept for signaling resume across all peers.
+   * When exceeded, the oldest entries of the peers with the largest backlog are evicted
+   * (those peers can then no longer resume past the gap). Default 512 MiB.
+   */
+  maxReplayLogBytesTotal?: number;
+  /** Queued bytes on one signaling socket before it is closed as a slow consumer. Default 80 MiB. */
+  maxSocketBufferedBytes?: number;
+  /** How long a committed or failed session is retained. Default 10 minutes. */
+  finishedSessionLingerMs?: number;
 }
 
 const DEFAULT_CAS_TTL_MS = 14 * 24 * 60 * 60 * 1000; // 14 days sliding TTL
@@ -134,6 +164,14 @@ export class CoordinatorEngine {
   private readonly sessionTtlMs: number;
   private readonly peerLossGraceMs: number;
   private readonly persistence?: CoordinatorPersistenceHook;
+  private readonly maxSessions: number;
+  private readonly maxReplayLogBytesTotal: number;
+  private readonly maxSocketBufferedBytes: number;
+  private readonly finishedSessionLingerMs: number;
+  private replayLogBytesTotal = 0;
+  private refusedSessions = 0;
+  private evictedReplayBytes = 0;
+  private slowConsumerDisconnects = 0;
 
   private slotCounter = 100;
   private readonly sessions = new Map<string, SessionRuntimeRecord>();
@@ -154,6 +192,15 @@ export class CoordinatorEngine {
     this.sessionTtlMs = options.sessionTtlMs ?? DEFAULT_SESSION_TTL_MS;
     this.peerLossGraceMs = options.peerLossGraceMs ?? DEFAULT_PEER_LOSS_GRACE_MS;
     this.persistence = options.persistence;
+    this.maxSessions = Math.max(1, options.maxSessions ?? DEFAULT_MAX_SESSIONS);
+    this.maxReplayLogBytesTotal = Math.max(
+      0,
+      options.maxReplayLogBytesTotal ?? DEFAULT_MAX_REPLAY_LOG_BYTES_TOTAL,
+    );
+    this.maxSocketBufferedBytes =
+      options.maxSocketBufferedBytes ?? DEFAULT_MAX_SOCKET_BUFFERED_BYTES;
+    this.finishedSessionLingerMs =
+      options.finishedSessionLingerMs ?? DEFAULT_FINISHED_SESSION_LINGER_MS;
 
     for (const r of options.initialEdgeRelays ?? []) {
       this.edgeRelays.set(r.relayId, {
@@ -312,6 +359,12 @@ export class CoordinatorEngine {
 
   getStats(): {
     activeSessions: number;
+    maxSessions: number;
+    refusedSessions: number;
+    replayLogBytes: number;
+    maxReplayLogBytes: number;
+    evictedReplayBytes: number;
+    slowConsumerDisconnects: number;
     activePairingSlots: number;
     casPackCount: number;
     edgeRelayCount: number;
@@ -322,6 +375,12 @@ export class CoordinatorEngine {
     const activeRelays = this.listActiveEdgeRelays();
     return {
       activeSessions: this.sessions.size,
+      maxSessions: this.maxSessions,
+      refusedSessions: this.refusedSessions,
+      replayLogBytes: this.replayLogBytesTotal,
+      maxReplayLogBytes: this.maxReplayLogBytesTotal,
+      evictedReplayBytes: this.evictedReplayBytes,
+      slowConsumerDisconnects: this.slowConsumerDisconnects,
       activePairingSlots: this.pairingSlots.size,
       casPackCount: this.casPacks.size,
       edgeRelayCount: activeRelays.length,
@@ -349,6 +408,7 @@ export class CoordinatorEngine {
     if (this.pairingSlots.has(slotCode)) {
       throw new Error(`SLOT_IN_USE: Pairing slot "${slotCode}" is currently active`);
     }
+    this.ensureSessionCapacity();
 
     const sourceToken = bytesToHex(randomBytes(24));
     const targetToken = bytesToHex(randomBytes(24));
@@ -434,7 +494,7 @@ export class CoordinatorEngine {
     session.joinAttempts += 1;
     if (session.joinAttempts > 3) {
       this.pairingSlots.delete(normalized);
-      session.state = "failed";
+      this.markSessionFinished(session, "failed");
       throw new Error("PAIRING_LOCKED: Too many join attempts");
     }
 
@@ -460,6 +520,7 @@ export class CoordinatorEngine {
     expiresInSeconds?: number;
   }): CreateManagedLeaseResponse {
     this.pruneExpired();
+    this.ensureSessionCapacity();
     const sessionId = globalThis.crypto.randomUUID();
     const sourceToken = bytesToHex(randomBytes(24));
     const targetToken = bytesToHex(randomBytes(24));
@@ -570,7 +631,7 @@ export class CoordinatorEngine {
     lost.lossTimer = setTimeout(() => {
       lost.lossTimer = null;
       if (lost.socket || session.state === "committed" || session.state === "failed") return;
-      session.state = "failed";
+      this.markSessionFinished(session, "failed");
       this.sendToPeer(survivor, {
         type: "session_error",
         code: "PEER_LOST",
@@ -710,6 +771,7 @@ export class CoordinatorEngine {
       }
 
       // Fresh attach: nothing sent before this point can be replayed to a brand-new client.
+      this.replayLogBytesTotal -= peerState.outLogBytes;
       peerState.outLog = [];
       peerState.outLogBytes = 0;
       peerState.outLogFloor = peerState.outSeq + 1;
@@ -1172,8 +1234,7 @@ export class CoordinatorEngine {
           });
           return;
         }
-        session.state = "committed";
-        session.completedAt = Date.now();
+        this.markSessionFinished(session, "committed");
 
         const doneMsg: ServerToClientWsMessage = {
           type: "session_committed",
@@ -1202,18 +1263,7 @@ export class CoordinatorEngine {
     let prunedSessions = 0;
     const objectsToDelete: string[] = [];
 
-    for (const [id, session] of this.sessions) {
-      if (session.expiresAt < now) {
-        if (session.slotCode) {
-          this.pairingSlots.delete(session.slotCode);
-        }
-        for (const key of session.ephemeralStorageKeys) {
-          objectsToDelete.push(key);
-        }
-        this.sessions.delete(id);
-        prunedSessions++;
-      }
-    }
+    prunedSessions = this.removeExpiredSessions(now, objectsToDelete);
 
     let prunedCasPacks = 0;
     for (const [mapKey, cas] of this.casPacks) {
@@ -1299,21 +1349,140 @@ export class CoordinatorEngine {
     const payload = JSON.stringify({ ...msg, sseq: seq });
     peer.outLog.push({ seq, payload });
     peer.outLogBytes += payload.length;
+    this.replayLogBytesTotal += payload.length;
     while (
       peer.outLogBytes > MAX_PEER_REPLAY_LOG_BYTES &&
       peer.outLog.length > 1
     ) {
-      const evicted = peer.outLog.shift()!;
-      peer.outLogBytes -= evicted.payload.length;
-      peer.outLogFloor = evicted.seq + 1;
+      this.evictOldestReplayEntry(peer);
     }
-    if (peer.socket) {
+    if (this.replayLogBytesTotal > this.maxReplayLogBytesTotal) {
+      this.shrinkReplayLogsToBudget();
+    }
+    const socket = peer.socket;
+    if (socket) {
+      if ((socket.bufferedAmount?.() ?? 0) > this.maxSocketBufferedBytes) {
+        // The peer is not reading. Queueing more would only grow memory; the message stays
+        // in the replay log, so a peer that comes back can resume.
+        this.slowConsumerDisconnects++;
+        try {
+          if (socket.terminate) {
+            socket.terminate();
+          } else {
+            socket.close(1013, "SLOW_CONSUMER");
+          }
+        } catch {
+          // Socket is already gone
+        }
+        return;
+      }
       try {
-        peer.socket.send(payload);
+        socket.send(payload);
       } catch {
         // Closed socket race; the entry stays in the replay log for resume
       }
     }
+  }
+
+  private evictOldestReplayEntry(peer: PeerRuntimeState): void {
+    const evicted = peer.outLog.shift();
+    if (!evicted) return;
+    peer.outLogBytes -= evicted.payload.length;
+    this.replayLogBytesTotal -= evicted.payload.length;
+    this.evictedReplayBytes += evicted.payload.length;
+    peer.outLogFloor = evicted.seq + 1;
+  }
+
+  /**
+   * Keeps the memory held for signaling resume within the global budget. Entries are taken
+   * from whichever peer currently has the largest backlog, so backlogs are levelled from the
+   * top: a peer that never acknowledges loses history first, and peers below the resulting
+   * level are untouched. A peer that lost entries is answered with `RESUME_GAP` if it later
+   * asks for them.
+   */
+  private shrinkReplayLogsToBudget(): void {
+    const lowWater = this.maxReplayLogBytesTotal * REPLAY_BUDGET_LOW_WATER_RATIO;
+    while (this.replayLogBytesTotal > lowWater) {
+      let largest: PeerRuntimeState | null = null;
+      let runnerUpBytes = 0;
+      for (const session of this.sessions.values()) {
+        for (const candidate of [session.source, session.target]) {
+          if (candidate.outLog.length === 0) continue;
+          if (!largest || candidate.outLogBytes > largest.outLogBytes) {
+            runnerUpBytes = largest ? largest.outLogBytes : 0;
+            largest = candidate;
+          } else if (candidate.outLogBytes > runnerUpBytes) {
+            runnerUpBytes = candidate.outLogBytes;
+          }
+        }
+      }
+      if (!largest) return;
+      // Bring the largest backlog down to the next one, then look again.
+      do {
+        this.evictOldestReplayEntry(largest);
+      } while (
+        largest.outLog.length > 0 &&
+        largest.outLogBytes >= runnerUpBytes &&
+        this.replayLogBytesTotal > lowWater
+      );
+    }
+  }
+
+  private markSessionFinished(
+    session: SessionRuntimeRecord,
+    state: "committed" | "failed",
+  ): void {
+    session.state = state;
+    if (state === "committed") {
+      session.completedAt = Date.now();
+    }
+    // The outcome stays readable for a reconnecting peer, but a finished session no longer
+    // occupies a slot for the full session TTL.
+    session.expiresAt = Math.min(
+      session.expiresAt,
+      Date.now() + this.finishedSessionLingerMs,
+    );
+  }
+
+  private ensureSessionCapacity(): void {
+    if (this.sessions.size < this.maxSessions) return;
+    const objectsToDelete: string[] = [];
+    this.removeExpiredSessions(Date.now(), objectsToDelete);
+    if (objectsToDelete.length > 0 && this.storageDriver.deleteObjects) {
+      void Promise.resolve(this.storageDriver.deleteObjects(objectsToDelete)).catch(() => {});
+    }
+    if (this.sessions.size >= this.maxSessions) {
+      this.refusedSessions++;
+      throw new Error(
+        `SERVER_BUSY: The session limit (${this.maxSessions}) is reached; retry later`,
+      );
+    }
+  }
+
+  /** Drops expired sessions and returns how many; their ephemeral object keys are appended to `objectsToDelete`. */
+  private removeExpiredSessions(now: number, objectsToDelete: string[]): number {
+    let removed = 0;
+    for (const [id, session] of this.sessions) {
+      if (session.expiresAt >= now) continue;
+      if (session.slotCode) {
+        this.pairingSlots.delete(session.slotCode);
+      }
+      for (const key of session.ephemeralStorageKeys) {
+        objectsToDelete.push(key);
+      }
+      for (const peer of [session.source, session.target]) {
+        this.replayLogBytesTotal -= peer.outLogBytes;
+        peer.outLog = [];
+        peer.outLogBytes = 0;
+        if (peer.lossTimer) {
+          clearTimeout(peer.lossTimer);
+          peer.lossTimer = null;
+        }
+      }
+      this.sessions.delete(id);
+      removed++;
+    }
+    return removed;
   }
 
   private trimReplayLog(peer: PeerRuntimeState, ackSeq: number): void {
@@ -1323,6 +1492,7 @@ export class CoordinatorEngine {
       peer.outLog[dropCount].seq <= ackSeq
     ) {
       peer.outLogBytes -= peer.outLog[dropCount].payload.length;
+      this.replayLogBytesTotal -= peer.outLog[dropCount].payload.length;
       dropCount++;
     }
     if (dropCount > 0) {

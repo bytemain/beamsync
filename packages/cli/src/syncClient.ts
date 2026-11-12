@@ -78,6 +78,8 @@ import { zstdCompress, zstdDecompress } from "./zstdCodec.js";
 
 export interface TransferCommonOptions {
   serverUrl: string;
+  /** Bearer token for servers that require one to create or join a pairing (`BEAMSYNC_API_TOKEN`). */
+  apiToken?: string;
   cacheDir?: string;
   hostIdOverride?: string;
   disableLocalIpc?: boolean;
@@ -290,6 +292,7 @@ export async function sendDirectory(
       scopeNamespace: options.scopeNamespace,
       customSlotCode,
     },
+    options.apiToken,
   );
 
   const pairingCode =
@@ -321,6 +324,7 @@ export async function receiveDirectory(
       joinRes = await httpPostJson<JoinPairingResponse>(
         `${baseHttp}/v1/pairings/join`,
         { slotCode: parsed.slotCode },
+        options.apiToken,
       );
       break;
     } catch (err) {
@@ -2435,6 +2439,14 @@ async function httpPostJson<T>(
     body: Buffer.from(JSON.stringify(body), "utf8"),
   });
   const text = res.body.toString("utf8");
+  if (res.status === 401) {
+    throw new Error(
+      `HTTP 401 from ${url}: ${text} — this server requires an API token ` +
+        (bearerToken
+          ? "and rejected the one provided"
+          : "(pass --api-token or set BEAMSYNC_API_TOKEN)"),
+    );
+  }
   if (res.status < 200 || res.status >= 300) {
     throw new Error(`HTTP ${res.status} from ${url}: ${text}`);
   }

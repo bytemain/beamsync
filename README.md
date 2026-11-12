@@ -159,10 +159,12 @@ beamsync doctor --server https://sync.yourdomain.com
 | `--delete-ignored` | receive | Delete target paths the sender ignored instead of keeping them |
 | `--disable-edge-relay` | both | Never use an Edge Relay |
 | `--no-port-mapping` | both | Do not request a NAT-PMP port mapping from the gateway |
+| `--api-token <token>` | both | Bearer token for a Coordinator that requires one to create or join a pairing |
 
 | Environment variable | Effect |
 | :--- | :--- |
 | `BEAMSYNC_SERVER_URL` | Default Coordinator URL |
+| `BEAMSYNC_API_TOKEN` | Same as `--api-token` |
 | `BEAMSYNC_PROXY` | Outbound proxy (`http://`, `https://`, `socks5://`); takes precedence over `HTTPS_PROXY` / `HTTP_PROXY` / `ALL_PROXY` |
 | `BEAMSYNC_NO_PROXY` / `NO_PROXY` | Hosts that bypass the proxy |
 | `BEAMSYNC_IGNORE_FILES` | Comma-separated extra ignore file names, same as repeating `--ignore-file` |
@@ -211,6 +213,9 @@ build/
 ### Known Limitations
 
 - Signaling resume covers network drops, not a Coordinator restart: session state lives in Coordinator memory.
+- The Coordinator is one process and all sessions live in its memory; it cannot be scaled out behind a load balancer. The file list of every session passes through it, so its memory follows the number of sessions exchanging file lists at the same moment (see the sizing table under Production Deployment). `MAX_REPLAY_BUFFER_MB` bounds only the messages kept for resume. When that budget is exceeded the oldest resume history of the largest backlog is dropped, and a client of that session that then loses its signaling connection fails with `RESUME_GAP` instead of resuming.
+- The Coordinator has no per-IP rate limit. `MAX_SESSIONS` and `BEAMSYNC_API_TOKEN` are the built-in controls; put request rate limiting in the reverse proxy.
+- Without `BEAMSYNC_API_TOKEN` anyone who can reach the Coordinator can create pairings, and can join a pending pairing by guessing its numeric slot. The key exchange still keeps such a peer from reading or writing data, but the pairing is used up and has to be started again.
 - An Edge Relay data connection that drops is not re-attached; unacknowledged packs fall back to `R2_PIPELINE`.
 - `--max-mbps` paces at pack granularity (wait, then send one pack of up to `~8 MiB`), so traffic is bursty within a pack. Caps below roughly `0.6 Mbps` can exceed the `120 s` inter-pack timeout on direct TCP and Edge Relay paths and trigger the R2 fallback.
 - UDP payload sizing probes a fixed list of sizes (`1420`, `1380`, `1340`, `1300`, `1232`) once after the punch. It is not continuous path-MTU discovery, and hosts that fragment oversized datagrams locally can still pass a probe.
@@ -231,7 +236,7 @@ build/
 
 ### 1. Central Coordinator (`beamsync-server` + Cloudflare R2)
 
-`beamsync-server` is a lightweight standalone Node.js daemon (1 vCPU / 512 MB RAM is plenty) because bulk payloads never pass through it—clients stream directly via P2P, regional Edge Relays, or presigned Cloudflare R2 URLs.
+`beamsync-server` is a standalone Node.js daemon. File contents never pass through it: clients stream directly, through a regional Edge Relay, or through presigned Cloudflare R2 URLs. The encrypted file list of each session does pass through it, so size it for the number of sessions that start at the same moment rather than for the amount of data moved. See [Access Control and Capacity](#access-control-and-capacity) below.
 
 1. Copy `.env.example` to `.env` and fill in your Cloudflare R2 S3 API credentials (`R2_ACCOUNT_ID`, `R2_BUCKET_NAME`, `R2_ACCESS_KEY_ID`, `R2_SECRET_ACCESS_KEY`) plus a 32-byte random `RELAY_AUTH_SECRET`:
    ```bash
@@ -248,7 +253,32 @@ build/
    ```
    *(Alternatively run `sudo bash deploy/install-vps.sh` for bare-metal `systemd`, or deploy via `fly.toml` / `railway.json`.)*
 
+#### Access Control and Capacity
+
+| Variable | Default | Effect |
+| :--- | :--- | :--- |
+| `BEAMSYNC_API_TOKEN` | unset | When set, `POST /v1/pairings`, `POST /v1/pairings/join`, and `POST /v1/leases` require `Authorization: Bearer <token>` and answer `401` otherwise. Both CLIs then need `--api-token` or `BEAMSYNC_API_TOKEN`. When unset, pairing is open to anyone who can reach the server. |
+| `MAX_SESSIONS` | `5000` | Concurrent sessions. Further pairing or lease requests get `503` with code `SERVER_BUSY` and `Retry-After: 30`. |
+| `MAX_REPLAY_BUFFER_MB` | `512` | Memory for signaling messages kept so a client can resume after a network drop, summed over all sessions. |
+
+A client that stops reading has its signaling socket closed once `80 MiB` are queued for it; it can reconnect and resume. A session that has committed or failed is dropped after `10` minutes.
+
+`GET /healthz` reports `activeSessions`, `maxSessions`, `refusedSessions`, `replayLogBytes`, `maxReplayLogBytes`, `evictedReplayBytes`, and `slowConsumerDisconnects`. A growing `evictedReplayBytes` means the replay budget is too small for the load.
+
+Coordinator memory, measured on a 2-core machine with a synthetic client on the same host sending `1.4 MB` file-list segments:
+
+| Load | Peak resident memory |
+| :--- | :--- |
+| Idle | `64 MB` |
+| 1 session streaming a 200-segment file list | `162 MB` |
+| 50 sessions streaming 40 segments each at the same moment | `973 MB` (`709 MB` of resume history dropped at the default budget) |
+| 20 sessions whose receivers never acknowledge, 60 segments each | `832 MB` (`1,666 MB` before the replay budget existed) |
+
+Relaying file lists cost about `11 ms` of CPU per segment in these runs, and the server moved about `95 MB/s` of segments while sharing the machine with the load generator. A host with 1 vCPU and `1 GB` of RAM covers a handful of simultaneous migrations; for tens of simultaneous starts use `2 GB` or more, or lower `MAX_SESSIONS`.
+
 ### 2. Regional Stateless Edge Relays (`beamsync-edge-relay`)
+
+An Edge Relay forwards each piece of a message to the other peer as it arrives and stops reading from a sender whose peer has more than `1 MiB` queued, so its memory does not grow with message size. Measured on a 2-core machine over loopback with TLS and `8 MiB` messages: `96 MB` resident memory with 1 pair and `235 MB` with 32 pairs transferring at once, at `2.0` to `2.4` CPU seconds per relayed GiB.
 
 #### Mode A: Domainless Raw IP + Self-Signed TLS (Zero Domain, Zero ICP Filing)
 

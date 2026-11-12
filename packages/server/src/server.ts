@@ -45,7 +45,16 @@ export interface BeamSyncServerConfig {
   /** Grace period before a peer without a signaling socket is reported as PEER_LOST (default 45 s). */
   peerLossGraceMs?: number;
   initialEdgeRelays?: EdgeRelayNodeInfo[];
+  /**
+   * When set, creating or joining a pairing and creating a managed lease require
+   * `Authorization: Bearer <apiToken>`. Without it those endpoints are open to anyone who
+   * can reach the server.
+   */
   apiToken?: string;
+  /** Sessions held at once, pending pairings included (default 5000). */
+  maxSessions?: number;
+  /** Total memory for un-acknowledged signaling messages kept for resume (default 512 MiB). */
+  maxReplayLogBytesTotal?: number;
   r2?: R2StorageConfig;
   builtinPutDelayMs?: number; // Test hook to observe concurrent upload/download overlap
   onObjectStoreEvent?: (event: ObjectStoreHookEvent) => void;
@@ -121,6 +130,8 @@ export async function startBeamSyncServer(
     initialEdgeRelays: config.initialEdgeRelays,
     peerLossGraceMs: config.peerLossGraceMs,
     persistence,
+    maxSessions: config.maxSessions,
+    maxReplayLogBytesTotal: config.maxReplayLogBytesTotal,
   });
   await coordinator.init();
 
@@ -176,8 +187,8 @@ export async function startBeamSyncServer(
       }
 
       if (method === "POST" && reqUrl.pathname === "/v1/pairings") {
-        if (!checkOptionalAuth(req, config.apiToken, false)) {
-          sendJson(res, 401, { error: "UNAUTHORIZED" });
+        if (!isAuthorized(req, config.apiToken)) {
+          sendUnauthorized(res);
           return;
         }
         const body = await readJsonBody<{
@@ -195,6 +206,10 @@ export async function startBeamSyncServer(
       }
 
       if (method === "POST" && reqUrl.pathname === "/v1/pairings/join") {
+        if (!isAuthorized(req, config.apiToken)) {
+          sendUnauthorized(res);
+          return;
+        }
         const body = await readJsonBody<{ slotCode: string }>(req);
         if (!body.slotCode) {
           sendJson(res, 400, { error: "MISSING_SLOT_CODE" });
@@ -210,8 +225,8 @@ export async function startBeamSyncServer(
       }
 
       if (method === "POST" && reqUrl.pathname === "/v1/leases") {
-        if (!checkOptionalAuth(req, config.apiToken, true)) {
-          sendJson(res, 401, { error: "UNAUTHORIZED" });
+        if (!isAuthorized(req, config.apiToken)) {
+          sendUnauthorized(res);
           return;
         }
         const body = await readJsonBody<CreateManagedLeaseRequest>(req);
@@ -298,6 +313,10 @@ export async function startBeamSyncServer(
       sendJson(res, 404, { error: "NOT_FOUND" });
     } catch (err) {
       const message = err instanceof Error ? err.message : String(err);
+      if (message.startsWith("SERVER_BUSY")) {
+        sendJson(res, 503, { error: message }, { "retry-after": "30" });
+        return;
+      }
       const status = message.startsWith("PAIRING_NOT_FOUND")
         ? 404
         : message.startsWith("SLOT_IN_USE")
@@ -329,6 +348,8 @@ export async function startBeamSyncServer(
         close: (code?: number, reason?: string) => {
           ws.close(code, reason);
         },
+        bufferedAmount: () => ws.bufferedAmount,
+        terminate: () => ws.terminate(),
       };
 
       ws.on("message", (data) => {
@@ -432,16 +453,20 @@ function deriveWsBaseUrl(
   return `${proto}://${host}`;
 }
 
-function checkOptionalAuth(
+/** True when no API token is configured, or the request carries it as a bearer token. */
+function isAuthorized(
   req: http.IncomingMessage,
   apiToken: string | undefined,
-  enforceIfConfigured: boolean,
 ): boolean {
-  if (!apiToken || !enforceIfConfigured) return true;
+  if (!apiToken) return true;
   const auth = req.headers.authorization ?? "";
-  if (!auth.startsWith("Bearer ")) return false;
+  if (!/^Bearer /i.test(auth)) return false;
   const provided = auth.slice("Bearer ".length).trim();
   return constantTimeEqual(utf8Bytes(provided), utf8Bytes(apiToken));
+}
+
+function sendUnauthorized(res: http.ServerResponse): void {
+  sendJson(res, 401, { error: "UNAUTHORIZED" }, { "www-authenticate": "Bearer" });
 }
 
 async function readJsonBody<T>(req: http.IncomingMessage): Promise<T> {
@@ -463,11 +488,13 @@ function sendJson(
   res: http.ServerResponse,
   status: number,
   payload: unknown,
+  extraHeaders: Record<string, string> = {},
 ): void {
   const body = JSON.stringify(payload);
   res.writeHead(status, {
     "content-type": "application/json; charset=utf-8",
     "content-length": String(Buffer.byteLength(body)),
+    ...extraHeaders,
   });
   res.end(body);
 }
