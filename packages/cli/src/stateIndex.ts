@@ -16,11 +16,13 @@ import {
   computeRootTreeDigest,
   DEFAULT_SMALL_FILE_THRESHOLD_BYTES,
   fastCdcChunk,
-  IgnoreMatcher,
+  LayeredIgnoreMatcher,
   utf8Bytes,
   validateRelativeSymlinkTarget,
   type FastCdcOptions,
   type FileChunkRef,
+  type IgnoreDecision,
+  type IgnoreSpec,
   type ManifestEntry,
   type TreeManifest,
 } from "@beamsync/protocol";
@@ -47,9 +49,25 @@ interface PersistedIndexFile {
   entries: Record<string, CachedFileIndexEntry>;
 }
 
-export interface ScanWorkspaceOptions {
-  cacheDir?: string;
+/** The ignore file that is always honoured, in every directory of the workspace. */
+export const DEFAULT_IGNORE_FILE_NAME = ".beamsyncignore";
+
+export interface IgnoreOptions {
+  /**
+   * Extra ignore file names to honour in every directory (e.g. `.raftmigrationignore`).
+   * Later names take precedence over earlier ones; `.beamsyncignore` always wins.
+   */
+  ignoreFileNames?: string[];
+  /** Also honour `.gitignore` files, with lower precedence than every other ignore file. */
+  respectGitignore?: boolean;
+  /** Explicit gitignore-style patterns anchored at the workspace root. Highest precedence. */
   extraIgnoreRules?: string[];
+  /** Rules files outside the workspace, anchored at the workspace root. Lowest precedence. */
+  ignoreFromFiles?: string[];
+}
+
+export interface ScanWorkspaceOptions extends IgnoreOptions {
+  cacheDir?: string;
   smallFileThresholdBytes?: number;
   cdcOptions?: FastCdcOptions;
 }
@@ -61,6 +79,152 @@ export interface ScanWorkspaceResult {
   blobSlices: Map<string, BlobDiskSlice>;
   cachedFileHits: number;
   hashedFiles: number;
+  /** Effective ignore rules, in a form the receiver can evaluate on its own tree. */
+  ignoreSpec: IgnoreSpec;
+  /** Entries skipped by a user rule (an ignored directory counts once). */
+  ignoredPathCount: number;
+  /** Workspace-relative paths of the ignore files that contributed rules. */
+  ignoreFilesLoaded: string[];
+}
+
+/** Ordered list of ignore file names: lowest precedence first. */
+export function resolveIgnoreFileNames(options: IgnoreOptions = {}): string[] {
+  const names: string[] = [];
+  const add = (name: string): void => {
+    const trimmed = name.trim();
+    if (!trimmed) return;
+    if (trimmed === "." || trimmed === ".." || /[\\/]/.test(trimmed)) {
+      throw new Error(
+        `Invalid ignore file name "${name}": expected a plain file name such as ".gitignore". ` +
+          `Use --ignore-from <path> for a rules file outside the workspace.`,
+      );
+    }
+    if (trimmed !== DEFAULT_IGNORE_FILE_NAME && !names.includes(trimmed)) names.push(trimmed);
+  };
+  if (options.respectGitignore) add(".gitignore");
+  for (const name of options.ignoreFileNames ?? []) add(name);
+  names.push(DEFAULT_IGNORE_FILE_NAME);
+  return names;
+}
+
+function splitRuleLines(content: string): string[] {
+  return content.replace(/^\uFEFF/, "").split(/\r?\n/);
+}
+
+interface IgnoreContext {
+  matcher: LayeredIgnoreMatcher;
+  fileNames: string[];
+  filesLoaded: string[];
+}
+
+async function createIgnoreContext(options: IgnoreOptions): Promise<IgnoreContext> {
+  const matcher = new LayeredIgnoreMatcher();
+  for (const fromPath of options.ignoreFromFiles ?? []) {
+    let content: string;
+    try {
+      content = await readFile(fromPath, "utf8");
+    } catch (err) {
+      throw new Error(
+        `Cannot read ignore rules file "${fromPath}": ${err instanceof Error ? err.message : err}`,
+      );
+    }
+    matcher.addLayer({
+      kind: "from",
+      source: path.basename(fromPath),
+      baseDir: "",
+      nameIndex: 0,
+      lines: splitRuleLines(content),
+    });
+  }
+  if (options.extraIgnoreRules?.length) {
+    matcher.addLayer({
+      kind: "explicit",
+      source: "--ignore",
+      baseDir: "",
+      nameIndex: 0,
+      lines: options.extraIgnoreRules,
+    });
+  }
+  return { matcher, fileNames: resolveIgnoreFileNames(options), filesLoaded: [] };
+}
+
+/** Loads the ignore files that sit directly in one directory, before its entries are tested. */
+async function loadDirectoryIgnoreFiles(
+  ctx: IgnoreContext,
+  dirAbs: string,
+  dirRel: string,
+  dirents: ReadonlyArray<{ name: string; isFile(): boolean }>,
+): Promise<void> {
+  for (let nameIndex = 0; nameIndex < ctx.fileNames.length; nameIndex++) {
+    const name = ctx.fileNames[nameIndex];
+    // Only regular files: a symlinked ignore file could pull in rules from outside the workspace
+    if (!dirents.some((d) => d.name === name && d.isFile())) continue;
+    const source = dirRel ? `${dirRel}/${name}` : name;
+    let content: string;
+    try {
+      content = await readFile(path.join(dirAbs, name), "utf8");
+    } catch (err) {
+      throw new Error(
+        `Cannot read ignore file "${source}": ${err instanceof Error ? err.message : err}`,
+      );
+    }
+    const added = ctx.matcher.addLayer({
+      kind: "file",
+      source,
+      baseDir: dirRel,
+      nameIndex,
+      lines: splitRuleLines(content),
+    });
+    if (added > 0) ctx.filesLoaded.push(source);
+  }
+}
+
+export interface IgnoredPathInfo {
+  relPath: string;
+  isDirectory: boolean;
+  /** Rule that matched (absent for built-in internal paths). */
+  pattern?: string;
+  /** Ignore file (workspace-relative), "--ignore", a rules file name, or "built-in". */
+  source?: string;
+}
+
+/**
+ * Walks a workspace without hashing anything and reports what a send would skip.
+ * Ignored directories are reported once and not entered.
+ */
+export async function listIgnoredPaths(
+  dirPath: string,
+  options: IgnoreOptions = {},
+): Promise<{ ignored: IgnoredPathInfo[]; includedEntries: number; ignoreFilesLoaded: string[] }> {
+  const resolvedRoot = await realpath(dirPath);
+  const ctx = await createIgnoreContext(options);
+  const ignored: IgnoredPathInfo[] = [];
+  let includedEntries = 0;
+
+  async function walk(currentAbs: string, currentRel: string): Promise<void> {
+    const dirents = await readdir(currentAbs, { withFileTypes: true });
+    dirents.sort((a, b) => (a.name < b.name ? -1 : a.name > b.name ? 1 : 0));
+    await loadDirectoryIgnoreFiles(ctx, currentAbs, currentRel, dirents);
+    for (const d of dirents) {
+      const childRel = currentRel ? `${currentRel}/${d.name}` : d.name;
+      const isDirectory = d.isDirectory();
+      const decision: IgnoreDecision = ctx.matcher.explain(childRel, isDirectory);
+      if (decision.ignored) {
+        ignored.push({
+          relPath: childRel,
+          isDirectory,
+          pattern: decision.pattern,
+          source: decision.source,
+        });
+        continue;
+      }
+      includedEntries++;
+      if (isDirectory) await walk(path.join(currentAbs, d.name), childRel);
+    }
+  }
+
+  await walk(resolvedRoot, "");
+  return { ignored, includedEntries, ignoreFilesLoaded: ctx.filesLoaded };
 }
 
 export async function scanWorkspace(
@@ -86,16 +250,9 @@ export async function scanWorkspace(
     // Fresh cache
   }
 
-  const ignoreLines: string[] = [...(options.extraIgnoreRules ?? [])];
-  for (const ignoreFile of [".beamsyncignore", ".syncignore"]) {
-    try {
-      const content = await readFile(path.join(resolvedRoot, ignoreFile), "utf8");
-      ignoreLines.push(...content.split(/\r?\n/));
-    } catch {
-      // Optional ignore file
-    }
-  }
-  const matcher = new IgnoreMatcher(ignoreLines);
+  const ignoreCtx = await createIgnoreContext(options);
+  const matcher = ignoreCtx.matcher;
+  let ignoredPathCount = 0;
 
   const smallThreshold =
     options.smallFileThresholdBytes ?? DEFAULT_SMALL_FILE_THRESHOLD_BYTES;
@@ -112,10 +269,14 @@ export async function scanWorkspace(
     const dirents = await readdir(currentAbs, { withFileTypes: true });
     dirents.sort((a, b) => (a.name < b.name ? -1 : a.name > b.name ? 1 : 0));
 
+    await loadDirectoryIgnoreFiles(ignoreCtx, currentAbs, currentRel, dirents);
+
     let hasIncludedChildren = false;
     for (const d of dirents) {
       const childRel = currentRel ? `${currentRel}/${d.name}` : d.name;
-      if (matcher.ignores(childRel)) {
+      const decision = matcher.explain(childRel, d.isDirectory());
+      if (decision.ignored) {
+        if (!decision.builtin) ignoredPathCount++;
         continue;
       }
       const childAbs = path.join(currentAbs, d.name);
@@ -138,7 +299,14 @@ export async function scanWorkspace(
       if (st.isSymbolicLink()) {
         hasIncludedChildren = true;
         const linkTarget = await readlink(childAbs);
-        validateRelativeSymlinkTarget(childRel, linkTarget);
+        try {
+          validateRelativeSymlinkTarget(childRel, linkTarget);
+        } catch (err) {
+          throw new Error(
+            `${err instanceof Error ? err.message : err}. ` +
+              `Exclude it with an ignore rule (--ignore "/${childRel}" or an ignore file) to send the rest.`,
+          );
+        }
         entries.push({
           kind: "symlink",
           relPath: childRel,
@@ -307,5 +475,8 @@ export async function scanWorkspace(
     blobSlices,
     cachedFileHits,
     hashedFiles,
+    ignoreSpec: matcher.toSpec(),
+    ignoredPathCount,
+    ignoreFilesLoaded: ignoreCtx.filesLoaded,
   };
 }

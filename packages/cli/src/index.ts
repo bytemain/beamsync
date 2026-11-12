@@ -10,3 +10,4 @@ export * from "./syncClient.js";
 export * from "./proxy.js";
 export * from "./httpClient.js";
 export * from "./portMapping.js";
+export * from "./cliArgs.js";

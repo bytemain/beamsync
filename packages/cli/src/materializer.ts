@@ -2,8 +2,10 @@ import {
   chmod,
   copyFile,
   link,
+  lstat,
   mkdir,
   open,
+  readdir,
   rename,
   rm,
   stat,
@@ -15,7 +17,9 @@ import {
 } from "node:fs/promises";
 import path from "node:path";
 import {
+  LayeredIgnoreMatcher,
   validateRelativeSymlinkTarget,
+  type IgnoreSpec,
   type ManifestFileEntry,
   type TreeManifest,
 } from "@beamsync/protocol";
@@ -35,6 +39,98 @@ interface ChunkSliceTarget {
 
 type BlobPlacement = WholeFileTarget | ChunkSliceTarget;
 
+export interface CommitResult {
+  committedFiles: number;
+  /** Paths the source ignored that were carried over from the previous target tree. */
+  preservedIgnoredPaths: number;
+  /** Paths that should have been carried over but could not be moved. */
+  preserveFailures: Array<{ relPath: string; error: string }>;
+  /** Previous target tree, kept on disk because a carry-over failed. */
+  retainedBackupDir?: string;
+}
+
+/** Validates rules received from the other peer and compiles them; null when there are none. */
+function buildCarryOverMatcher(spec: IgnoreSpec): LayeredIgnoreMatcher | null {
+  const kinds = ["from", "file", "explicit"];
+  const valid =
+    spec !== null &&
+    typeof spec === "object" &&
+    spec.version === 1 &&
+    Array.isArray(spec.layers) &&
+    spec.layers.every(
+      (l) =>
+        l !== null &&
+        typeof l === "object" &&
+        kinds.includes(l.kind) &&
+        typeof l.source === "string" &&
+        typeof l.baseDir === "string" &&
+        Number.isInteger(l.nameIndex) &&
+        Array.isArray(l.lines) &&
+        l.lines.every((line) => typeof line === "string"),
+    );
+  if (!valid) {
+    throw new Error("Invalid ignoreSpec in transfer plan");
+  }
+  const matcher = LayeredIgnoreMatcher.fromSpec(spec);
+  return matcher.ruleCount > 0 ? matcher : null;
+}
+
+/**
+ * Moves paths the source ignored out of the previous target tree (`oldRoot`) into the freshly
+ * committed one (`newRoot`). Anything the source sent wins; internal BeamSync state is skipped.
+ */
+export async function carryOverIgnoredPaths(
+  oldRoot: string,
+  newRoot: string,
+  matcher: LayeredIgnoreMatcher,
+): Promise<{ moved: number; failures: Array<{ relPath: string; error: string }> }> {
+  let moved = 0;
+  const failures: Array<{ relPath: string; error: string }> = [];
+  const describe = (err: unknown): string => (err instanceof Error ? err.message : String(err));
+
+  async function walk(oldAbs: string, rel: string): Promise<void> {
+    let dirents;
+    try {
+      dirents = await readdir(oldAbs, { withFileTypes: true });
+    } catch (err) {
+      failures.push({ relPath: rel || ".", error: describe(err) });
+      return;
+    }
+    dirents.sort((a, b) => (a.name < b.name ? -1 : a.name > b.name ? 1 : 0));
+    for (const d of dirents) {
+      const childRel = rel ? `${rel}/${d.name}` : d.name;
+      const isDirectory = d.isDirectory();
+      if (matcher.isBuiltinIgnored(childRel, isDirectory)) continue;
+
+      const oldChild = path.join(oldAbs, d.name);
+      const newChild = path.join(newRoot, ...childRel.split("/"));
+      const newStat = await lstat(newChild).catch(() => null);
+      if (newStat) {
+        // The source sent this path. Only a directory on both sides can still hold ignored paths.
+        if (isDirectory && newStat.isDirectory()) await walk(oldChild, childRel);
+        continue;
+      }
+
+      if (matcher.ignores(childRel, isDirectory)) {
+        try {
+          await mkdir(path.dirname(newChild), { recursive: true });
+          await rename(oldChild, newChild);
+          moved++;
+        } catch (err) {
+          failures.push({ relPath: childRel, error: describe(err) });
+        }
+        continue;
+      }
+
+      // A directory the source no longer has may still contain paths the source would ignore
+      if (isDirectory) await walk(oldChild, childRel);
+    }
+  }
+
+  await walk(oldRoot, "");
+  return { moved, failures };
+}
+
 export class AtomicWorkspaceMaterializer {
   readonly targetDir: string;
   readonly stagingDir: string;
@@ -42,6 +138,8 @@ export class AtomicWorkspaceMaterializer {
   private readonly manifest: TreeManifest;
   private readonly rootTreeDigest: string;
   private readonly existingBlobs: ReadonlyMap<string, BlobDiskSlice>;
+  /** Built from the source's rules up front, so a malformed spec fails before anything moves. */
+  private readonly carryOverMatcher: LayeredIgnoreMatcher | null;
   private readonly placements = new Map<string, BlobPlacement[]>();
   private readonly pendingBlobHashes = new Set<string>();
   private readonly hardlinkCanonicals = new Map<string, ManifestFileEntry>();
@@ -56,7 +154,15 @@ export class AtomicWorkspaceMaterializer {
     manifest: TreeManifest;
     rootTreeDigest: string;
     existingBlobs: ReadonlyMap<string, BlobDiskSlice>;
+    /** Ignore rules the source applied; matching paths in the old target tree are kept. */
+    ignoreSpec?: IgnoreSpec;
+    /** Mirror exactly: delete target paths the source ignored instead of keeping them. */
+    deleteIgnored?: boolean;
   }) {
+    this.carryOverMatcher =
+      !params.deleteIgnored && params.ignoreSpec
+        ? buildCarryOverMatcher(params.ignoreSpec)
+        : null;
     this.targetDir = path.resolve(params.targetDir);
     this.sessionId = params.sessionId;
     const parentDir = path.dirname(this.targetDir);
@@ -192,7 +298,7 @@ export class AtomicWorkspaceMaterializer {
     }
   }
 
-  async commit(): Promise<{ committedFiles: number }> {
+  async commit(): Promise<CommitResult> {
     if (this.pendingBlobHashes.size > 0) {
       const sample = Array.from(this.pendingBlobHashes).slice(0, 3).join(", ");
       throw new Error(
@@ -283,11 +389,30 @@ export class AtomicWorkspaceMaterializer {
       throw err;
     }
 
-    if (hadExistingTarget) {
+    // 6. Keep what the source deliberately skipped (dependency folders, local env files, ...)
+    let preservedIgnoredPaths = 0;
+    let preserveFailures: CommitResult["preserveFailures"] = [];
+    if (hadExistingTarget && this.carryOverMatcher) {
+      try {
+        const carried = await carryOverIgnoredPaths(backupDir, this.targetDir, this.carryOverMatcher);
+        preservedIgnoredPaths = carried.moved;
+        preserveFailures = carried.failures;
+      } catch (err) {
+        // The new tree is already in place; never lose the previous one over a carry-over error
+        preserveFailures = [{ relPath: ".", error: err instanceof Error ? err.message : String(err) }];
+      }
+    }
+
+    if (hadExistingTarget && preserveFailures.length === 0) {
       await rm(backupDir, { recursive: true, force: true });
     }
 
-    return { committedFiles };
+    return {
+      committedFiles,
+      preservedIgnoredPaths,
+      preserveFailures,
+      retainedBackupDir: preserveFailures.length > 0 ? backupDir : undefined,
+    };
   }
 
   async abort(): Promise<void> {

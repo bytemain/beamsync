@@ -32,6 +32,8 @@ The system consists of three components:
 9. **UDP Payload Probing & Keepalive**: Datagram size is `chunk payload + 45` bytes (plus `28` bytes of IPv4/UDP headers). After the punch the sender sends `MTU_PROBE` packets padded to payload sizes `1420, 1380, 1340, 1300, 1232` and adopts the largest size acknowledged by `MTU_PROBE_ACK`, otherwise stays at `1150`. A `KEEPALIVE` packet every `5 s` preserves the NAT binding while the channel is idle.
 10. **Gateway Port Mapping (NAT-PMP, RFC 6886)**: In parallel with STUN classification the CLI asks the default IPv4 gateway (private addresses only; `/proc/net/route` on Linux, `route -n get default` on macOS/FreeBSD) on UDP `5351` for the external address and a UDP mapping of the punch socket (`7200 s` lifetime, `250 ms` budget). The mapped endpoint is advertised first unless the NAT is already `endpoint_independent`, renewed at half lifetime, and deleted (lifetime `0`) on session end.
 
+11. **Ignore Rules**: The source evaluates layered rule sets with `.gitignore` pattern semantics while walking the tree; an ignored directory is not entered. Each layer is `{kind, source, baseDir, nameIndex, lines}` and patterns are anchored at `baseDir`. Layers are ordered by `kind` (`from` < `file` < `explicit`), then `nameIndex` (position of the ignore file name: `.gitignore` when enabled, configured names in order, `.beamsyncignore` last), then directory depth; the last matching rule across the applicable layers decides. Built-in patterns (`.beamsync/`, `.beamsync-*`, `.sync-staging-*`, `.DS_Store`) are checked first and are not negatable. Only regular files are read as ignore files. The effective layers travel to the target as `source_transfer_plan.ignoreSpec` (`{version: 1, layers}`), omitted when no user rule exists. After the atomic swap the target walks its previous tree top-down and moves every path that matches the spec and is absent from the new tree into the new tree (`rename`, same filesystem); paths present in the new tree always win, and built-in paths are never carried over. A failed move leaves the previous tree at `.<name>.beamsync-old-<sessionId>` and is reported in `preserveFailures` / `retainedBackupDir`. `deleteIgnored` on the target skips the carry-over.
+
 ## 4. Cryptographic & Bilateral Equilibrium Invariants
 
 - **Zero-Knowledge Pairing (Curve25519 EKE PAKE)**: Masks ephemeral X25519 public keys with shared-phrase role masks to derive `K_root`, `K_transport`, `K_pack`, and `K_host`.
@@ -47,3 +49,8 @@ The system consists of three components:
 - UDP payload probing is a one-shot search over fixed sizes, not continuous PMTUD.
 - Port mapping covers NAT-PMP and UDP only (no UPnP IGD, no PCP, no TCP mapping).
 - UDP candidates are IPv4 only; no QUIC transport; no single-port multiplexing of Coordinator, Edge Relay, and STUN.
+- `source_transfer_plan` carries the full manifest in one signaling message. Messages above `MAX_SIGNALING_MESSAGE_BYTES` (`32 MiB`) are refused by the sending client (`SIGNALING_MESSAGE_TOO_LARGE`, surfaced for the plan as `MANIFEST_TOO_LARGE`); there is no chunked or streamed manifest.
+- The source scan aborts on absolute symlinks, symlinks escaping the root, and unreadable paths; it skips sockets, FIFOs, and device nodes silently; it does not stop at mount points.
+- The manifest has `dir` entries for empty directories only, so the mode of a non-empty directory is not transferred.
+- The target's pre-plan scan is unaware of the source's ignore rules.
+- Manifest paths and `ignoreSpec` are visible to the Coordinator.

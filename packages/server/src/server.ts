@@ -7,6 +7,7 @@ import { WebSocketServer, type WebSocket } from "ws";
 import {
   bytesToHex,
   constantTimeEqual,
+  MAX_SIGNALING_MESSAGE_BYTES,
   randomBytes,
   utf8Bytes,
   verifyEdgeRelayHeartbeat,
@@ -308,7 +309,7 @@ export async function startBeamSyncServer(
 
   const wss = new WebSocketServer({
     noServer: true,
-    maxPayload: 32 * 1024 * 1024,
+    maxPayload: MAX_SIGNALING_MESSAGE_BYTES,
   });
 
   server.on("upgrade", (req, socket, head) => {
@@ -334,6 +335,11 @@ export async function startBeamSyncServer(
         const str = typeof data === "string" ? data : data.toString("utf8");
         void coordinator.handleWsMessage(sessionId, handle, str);
       });
+
+      // Protocol violations (an oversized frame, invalid UTF-8, ...) surface as "error" before
+      // "close". Without a listener they would be uncaught and take the whole process down.
+      // The ws library answers with the matching close code (1009, 1007, ...) on its own.
+      ws.on("error", () => {});
 
       ws.on("close", () => {
         coordinator.detachSocket(sessionId, handle);

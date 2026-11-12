@@ -2,7 +2,14 @@ import type {
   EdgeRelayNodeInfo,
   SignedEdgeRelayAllocation,
 } from "./edgeRelayTicket.js";
+import type { IgnoreSpec } from "./ignore.js";
 import type { TreeManifest } from "./manifest.js";
+
+/**
+ * Largest signaling message the Coordinator accepts. The transfer plan (the whole manifest)
+ * travels as one message, which bounds how many entries a single transfer can carry.
+ */
+export const MAX_SIGNALING_MESSAGE_BYTES = 32 * 1024 * 1024;
 
 export type TransportTier =
   | "LOCAL_IPC"
@@ -135,6 +142,11 @@ export type ClientToServerWsMessage =
       directUpgradePending?: boolean;
       /** Which direct channel the source will write to when `selectedTier` is `P2P_DIRECT`. */
       directChannel?: DirectUpgradeChannelKind;
+      /**
+       * Ignore rules the source applied. The target uses them to keep its own copies of paths
+       * the source skipped instead of deleting them.
+       */
+      ignoreSpec?: IgnoreSpec;
     }
   | {
       type: "transport_ready";
@@ -227,6 +239,11 @@ export type ServerToClientWsMessage =
       directUpgradePending?: boolean;
       /** Which direct channel the source will write to when `selectedTier` is `P2P_DIRECT`. */
       directChannel?: DirectUpgradeChannelKind;
+      /**
+       * Ignore rules the source applied. The target uses them to keep its own copies of paths
+       * the source skipped instead of deleting them.
+       */
+      ignoreSpec?: IgnoreSpec;
     }
   | {
       type: "transport_ready";

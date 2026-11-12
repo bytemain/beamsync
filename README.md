@@ -21,6 +21,9 @@ Run `beamsync-server` (bound to Cloudflare R2) plus optional regional `beamsync-
 - **Small-File & Large-File Engine (`BMSP` Packs + FastCDC)**:
   - Persistent local `(ino, size, mtimeNs, ctimeNs)` stat cache avoids re-hashing unchanged files across tens of thousands of source files.
   - Small files (`<= 256 KiB`) are whole-file BLAKE3-hashed and coalesced into `~8 MiB` `zstd`-compressed, `ChaCha20-Poly1305`-encrypted `BMSP` packs; large files (`> 256 KiB`) are split with Gear-based FastCDC (`64 KiB–1 MiB`) so single-line edits only transmit changed chunks.
+- **Sender-Side Ignore Rules (`.gitignore` syntax)**:
+  - `.beamsyncignore` files are read in every directory of the source. Any other file name can be added with `--ignore-file <name>` (for example `--ignore-file .raftmigrationignore`), and `.gitignore` files are honoured with `--respect-gitignore`.
+  - Ignored directories are never entered, read, or hashed. The receiver keeps its own copies of paths the sender ignored instead of deleting them; `--delete-ignored` on the receiver turns the transfer into an exact mirror.
 - **Relay First, Upgrade Later**:
   - Direct-path discovery (same-host IPC, Happy Eyeballs TCP, UDP hole punch) starts in the background as soon as both peers are paired. If no direct path is ready after a `250 ms` grace window and an Edge Relay is eligible, the transfer starts on the relay immediately instead of waiting for NAT traversal.
   - When a direct path comes up later, the source offers it (`direct_upgrade_offer` / `direct_upgrade_answer`), finishes the pack in flight, and continues on `P2P_DIRECT` from the next pack boundary. No pack is sent twice and nothing touches R2. Disable with `--no-optimistic-relay`.
@@ -118,6 +121,16 @@ beamsync receive ./workspace-copy \
   --server https://sync.yourdomain.com \
   --code migrate-devbox-42
 
+# Skip everything .gitignore and a project-specific ignore file exclude, plus one extra pattern
+beamsync send ./workspace \
+  --server https://sync.yourdomain.com \
+  --respect-gitignore \
+  --ignore-file .raftmigrationignore \
+  --ignore '*.core'
+
+# Preview what a send would skip, with the rule and file responsible for each path
+beamsync ignored ./workspace --respect-gitignore --ignore-file .raftmigrationignore
+
 # Run behind a corporate egress proxy (HTTP CONNECT or SOCKS5)
 BEAMSYNC_PROXY=http://user:pass@proxy.corp.example:3128 \
   beamsync send ./workspace --server https://sync.yourdomain.com
@@ -135,6 +148,11 @@ beamsync doctor --server https://sync.yourdomain.com
 | `--force-tier <tier>` | send | Pin one transport tier |
 | `--no-optimistic-relay` | send | Wait for direct-path probing instead of starting on the Edge Relay |
 | `--no-udp-mtu-probe` | send | Keep `1150`-byte UDP chunks |
+| `--ignore <pattern>` | send, ignored | Skip matching paths; repeatable; highest precedence |
+| `--ignore-file <name>` | send, ignored | Also read ignore files with this name in every directory; repeatable or comma-separated |
+| `--respect-gitignore` | send, ignored | Also honour `.gitignore` files (off by default) |
+| `--ignore-from <path>` | send, ignored | Read root-anchored rules from a file outside the workspace; repeatable; lowest precedence |
+| `--delete-ignored` | receive | Delete target paths the sender ignored instead of keeping them |
 | `--disable-edge-relay` | both | Never use an Edge Relay |
 | `--no-port-mapping` | both | Do not request a NAT-PMP port mapping from the gateway |
 
@@ -143,6 +161,48 @@ beamsync doctor --server https://sync.yourdomain.com
 | `BEAMSYNC_SERVER_URL` | Default Coordinator URL |
 | `BEAMSYNC_PROXY` | Outbound proxy (`http://`, `https://`, `socks5://`); takes precedence over `HTTPS_PROXY` / `HTTP_PROXY` / `ALL_PROXY` |
 | `BEAMSYNC_NO_PROXY` / `NO_PROXY` | Hosts that bypass the proxy |
+| `BEAMSYNC_IGNORE_FILES` | Comma-separated extra ignore file names, same as repeating `--ignore-file` |
+
+### Ignore Rules
+
+The sender decides what is transferred. Rules use `.gitignore` syntax: `#` comments, `!` negation, a leading or inner `/` anchors a pattern to the directory of its ignore file, a trailing `/` matches directories only, and `*`, `?`, `[a-z]`, `**/`, `/**` behave as in git. An ignored directory is skipped as a whole, so nothing inside it can be re-included.
+
+Rule sources, lowest precedence first (the last matching rule wins):
+
+1. `--ignore-from <path>`: a rules file outside the workspace, anchored at the workspace root.
+2. Ignore files inside the workspace, in this order of file name: `.gitignore` (only with `--respect-gitignore`), then each `--ignore-file` / `BEAMSYNC_IGNORE_FILES` name in the order given, then `.beamsyncignore`. For the same file name, a file in a deeper directory wins over one higher up. A later file name wins over an earlier one at any depth, so a root `.raftmigrationignore` containing `!.env` overrides every `.gitignore` in the tree.
+3. `--ignore <pattern>`: anchored at the workspace root.
+
+`.gitignore` is opt-in on purpose: a devbox migration usually wants the untracked files git ignores (`.env`, local databases, IDE state). Ignore files themselves are transferred like any other file. Symlinked ignore files are not followed. Ignore files in directories above the source directory, `.git/info/exclude`, and git's global excludes file are not read.
+
+BeamSync's own state (`.beamsync/`, `.beamsync-*`, `.sync-staging-*`) and `.DS_Store` are always skipped and cannot be re-included.
+
+On the receiver, a transfer replaces the target directory with the sender's tree. Target paths that match the sender's rules and that the sender did not send are carried over from the previous tree (rsync's behaviour without `--delete-excluded`), so the target's own `node_modules` or `.env` survive a re-sync. Paths the sender does not have and does not ignore are removed. If a path cannot be carried over, the previous tree is left on disk and its location is reported as `retainedBackupDir`. Pass `--delete-ignored` to `receive` for an exact mirror.
+
+A starting point for a code workspace (`.beamsyncignore` at the workspace root):
+
+```gitignore
+# Dependency and build output that the target can regenerate
+node_modules/
+.venv/
+venv/
+__pycache__/
+target/
+dist/
+build/
+.next/
+.turbo/
+.gradle/
+
+# Caches and logs
+.cache/
+*.log
+*.pyc
+
+# Sockets and runtime state
+*.sock
+*.pid
+```
 
 ### Known Limitations
 
@@ -152,6 +212,12 @@ beamsync doctor --server https://sync.yourdomain.com
 - UDP payload sizing probes a fixed list of sizes (`1420`, `1380`, `1340`, `1300`, `1232`) once after the punch. It is not continuous path-MTU discovery, and hosts that fragment oversized datagrams locally can still pass a probe.
 - Port mapping speaks NAT-PMP only (no UPnP IGD or PCP), maps UDP only, and has been tested against a protocol-level mock gateway, not against physical routers.
 - UDP candidates are IPv4 only. There is no QUIC transport, and the Coordinator, Edge Relay, and STUN listeners do not share a single port.
+- The whole manifest travels in one signaling message, capped at `32 MiB` (about `205` bytes per entry in a measured tree, so roughly `160,000` files). A larger tree is refused before streaming with `MANIFEST_TOO_LARGE`; ignore rules are currently the only way to bring the entry count down.
+- The scan stops on the first path it cannot represent: an absolute symlink, a symlink that points outside the source directory, or a file or directory the user cannot read. Exclude such paths with an ignore rule. Sockets, FIFOs, and device nodes are skipped without a message.
+- The scan follows the directory tree across mount points; there is no one-file-system option.
+- Permission bits are transferred for files and for empty directories only. A non-empty directory is created with the receiver's default mode.
+- The receiver hashes its existing directory before it learns the sender's ignore rules, so paths the sender ignores are hashed there without being used.
+- File paths and ignore rules are part of the transfer plan, which the Coordinator relays unencrypted; only file contents are end-to-end encrypted.
 
 ---
 

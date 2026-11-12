@@ -10,6 +10,7 @@ import {
   encodePack,
   formatPairingPhrase,
   generateSecretWords,
+  MAX_SIGNALING_MESSAGE_BYTES,
   hexToBytes,
   PakeHandshake,
   parsePairingPhrase,
@@ -49,7 +50,11 @@ import {
 import { buildSessionHostFingerprint } from "./hostIdentity.js";
 import { httpRequestBytes } from "./httpClient.js";
 import { AtomicWorkspaceMaterializer } from "./materializer.js";
-import { scanWorkspace, type BlobDiskSlice } from "./stateIndex.js";
+import {
+  scanWorkspace,
+  type BlobDiskSlice,
+  type IgnoreOptions,
+} from "./stateIndex.js";
 import {
   establishUdpHolePunch,
   finishUdpStream,
@@ -85,6 +90,11 @@ export interface TransferCommonOptions {
   optimisticRelayGraceMs?: number;
   /** Total time budget for transparently resuming a dropped signaling socket (default 30 s; 0 disables). */
   signalingReconnectBudgetMs?: number;
+  /**
+   * Largest signaling message this client will send (default: the Coordinator's 32 MiB limit).
+   * A larger message is refused locally instead of being rejected by the Coordinator.
+   */
+  maxSignalingMessageBytes?: number;
   /** Disable probe-based UDP payload sizing and keep the conservative 1150-byte chunks. */
   disableUdpMtuProbe?: boolean;
   /** Do not ask the local gateway for a UDP port mapping (NAT-PMP). */
@@ -107,12 +117,11 @@ export interface TransferCommonOptions {
   }) => void;
 }
 
-export interface SendDirectoryOptions extends TransferCommonOptions {
+export interface SendDirectoryOptions extends TransferCommonOptions, IgnoreOptions {
   sourceDir: string;
   scopeNamespace?: string;
   customSlotCode?: string;
   customSecretWords?: string;
-  extraIgnoreRules?: string[];
   simulateP2pDropAfterPacks?: number;
   simulateEdgeRelayDropAfterPacks?: number;
   /** Test hook: delays background direct-path discovery so the Edge Relay starts first. */
@@ -123,6 +132,11 @@ export interface SendDirectoryOptions extends TransferCommonOptions {
 export interface ReceiveDirectoryOptions extends TransferCommonOptions {
   targetDir: string;
   pairingCode: string;
+  /**
+   * Delete target paths that match the source's ignore rules. By default they are kept, so a
+   * re-sync does not wipe the target's own dependency folders or local env files.
+   */
+  deleteIgnored?: boolean;
   rejectedDirectAttemptCounter?: { count: number };
 }
 
@@ -151,6 +165,10 @@ export interface SendTransferSummary {
   signalingReconnects: number;
   /** UDP chunk payload size in use (after path probing), when a UDP path was established. */
   udpChunkPayloadBytes?: number;
+  /** Entries skipped by an ignore rule (an ignored directory counts once). */
+  ignoredPaths: number;
+  /** Workspace-relative ignore files that contributed rules. */
+  ignoreFilesLoaded: string[];
 }
 
 export interface ReceiveTransferSummary {
@@ -165,6 +183,11 @@ export interface ReceiveTransferSummary {
   packsApplied: number;
   firstPackAppliedAtMs: number | null;
   durationMs: number;
+  /** Target paths kept because the source's ignore rules cover them. */
+  preservedIgnoredPaths: number;
+  /** Ignored paths that could not be carried over; the previous tree is kept when non-empty. */
+  preserveFailures: Array<{ relPath: string; error: string }>;
+  retainedBackupDir?: string;
 }
 
 const DEFAULT_TARGET_PACK_BYTES = 8 * 1024 * 1024; // 8 MiB
@@ -199,6 +222,28 @@ function createBandwidthPacer(
       await new Promise((r) => setTimeout(r, Math.ceil(waitMs)));
     }
   };
+}
+
+/** Sends the plan, turning the generic size error into one that says what to do about it. */
+function sendTransferPlan(
+  sig: SignalingClient,
+  entryCount: number,
+  plan: Extract<ClientToServerWsMessage, { type: "source_transfer_plan" }>,
+): void {
+  try {
+    sig.send(plan);
+  } catch (err) {
+    if (err instanceof SignalingMessageTooLargeError) {
+      throw new Error(
+        `MANIFEST_TOO_LARGE: the transfer plan lists ${entryCount} entries and is ` +
+          `${formatMiB(err.messageBytes)}; one transfer can carry at most ${formatMiB(err.limitBytes)}. ` +
+          `Skip paths the target can regenerate (dependency folders, build output, caches) with ` +
+          `ignore rules: a .beamsyncignore file, --ignore-file <name>, --respect-gitignore or ` +
+          `--ignore <pattern>. "beamsync ignored <dir>" previews what would be skipped.`,
+      );
+    }
+    throw err;
+  }
 }
 
 export async function sendDirectory(
@@ -363,6 +408,25 @@ const PEER_JOIN_WAIT_MS = 10 * 60 * 1000;
  * `hello.resumeFromSeq`, replays its un-acknowledged outbox, and the Coordinator
  * replays everything the client missed. Callers never observe the gap.
  */
+export class SignalingMessageTooLargeError extends Error {
+  readonly code = "SIGNALING_MESSAGE_TOO_LARGE";
+  constructor(
+    readonly messageType: string,
+    readonly messageBytes: number,
+    readonly limitBytes: number,
+  ) {
+    super(
+      `SIGNALING_MESSAGE_TOO_LARGE: "${messageType}" is ${formatMiB(messageBytes)}, ` +
+        `above the ${formatMiB(limitBytes)} signaling limit`,
+    );
+  }
+}
+
+function formatMiB(bytes: number): string {
+  const mib = bytes / (1024 * 1024);
+  return mib >= 10 ? `${mib.toFixed(0)} MiB` : mib >= 0.1 ? `${mib.toFixed(1)} MiB` : `${bytes} B`;
+}
+
 class SignalingClient {
   private ws: WebSocket | null = null;
   private readonly listeners = new Set<(msg: ServerToClientWsMessage) => void>();
@@ -387,15 +451,17 @@ class SignalingClient {
   private constructor(
     private readonly wsUrl: string,
     private readonly reconnectBudgetMs: number,
+    private readonly maxMessageBytes: number,
   ) {}
 
   static async connect(
     wsUrl: string,
-    opts: { reconnectBudgetMs?: number } = {},
+    opts: { reconnectBudgetMs?: number; maxMessageBytes?: number } = {},
   ): Promise<SignalingClient> {
     const client = new SignalingClient(
       wsUrl,
       opts.reconnectBudgetMs ?? DEFAULT_SIGNALING_RECONNECT_BUDGET_MS,
+      opts.maxMessageBytes ?? MAX_SIGNALING_MESSAGE_BYTES,
     );
     const ws = await client.openSocket(15_000);
     client.attach(ws);
@@ -589,8 +655,14 @@ class SignalingClient {
       this.rawSend(JSON.stringify(msg));
       return;
     }
+    const payload = JSON.stringify({ ...msg, cseq: this.nextClientSeq + 1 });
+    // The Coordinator closes the socket on an oversized frame. Queuing one would make every
+    // resume replay it and be closed again, so refuse it here, before it enters the outbox.
+    const payloadBytes = Buffer.byteLength(payload, "utf8");
+    if (payloadBytes > this.maxMessageBytes) {
+      throw new SignalingMessageTooLargeError(msg.type, payloadBytes, this.maxMessageBytes);
+    }
     const cseq = ++this.nextClientSeq;
-    const payload = JSON.stringify({ ...msg, cseq });
     this.outbox.push({ cseq, payload });
     this.outboxBytes += payload.length;
     this.rawSend(payload);
@@ -709,6 +781,7 @@ async function runSourceSession(params: {
   const { options, sessionId, wsUrl, stunServers, edgeRelays } = params;
   const sig = await SignalingClient.connect(wsUrl, {
     reconnectBudgetMs: options.signalingReconnectBudgetMs,
+    maxMessageBytes: options.maxSignalingMessageBytes,
   });
   sig.onReconnect = (n) =>
     options.onProgress?.({ phase: "signaling_resumed", detail: `reconnects=${n}` });
@@ -731,6 +804,9 @@ async function runSourceSession(params: {
     const sourceScanPromise = scanWorkspace(options.sourceDir, {
       cacheDir: options.cacheDir,
       extraIgnoreRules: options.extraIgnoreRules,
+      ignoreFileNames: options.ignoreFileNames,
+      respectGitignore: options.respectGitignore,
+      ignoreFromFiles: options.ignoreFromFiles,
       smallFileThresholdBytes: options.smallFileThresholdBytes,
       cdcOptions: options.cdcOptions,
     });
@@ -1031,7 +1107,7 @@ async function runSourceSession(params: {
     const committedPromise = sig.waitFor("session_committed", 0);
     committedPromise.catch(() => {});
 
-    sig.send({
+    sendTransferPlan(sig, sourceScan.manifest.entries.length, {
       type: "source_transfer_plan",
       manifest: sourceScan.manifest,
       rootTreeDigest: sourceScan.rootTreeDigest,
@@ -1042,6 +1118,8 @@ async function runSourceSession(params: {
       directUpgradePending: pendingDirectUpgrade ? true : undefined,
       directChannel:
         selectedTier === "P2P_DIRECT" ? (udpChan ? "udp" : "tcp") : undefined,
+      ignoreSpec:
+        sourceScan.ignoreSpec.layers.length > 0 ? sourceScan.ignoreSpec : undefined,
     });
 
     const targetPackBytes = options.targetPackBytes ?? DEFAULT_TARGET_PACK_BYTES;
@@ -1405,6 +1483,8 @@ async function runSourceSession(params: {
       packsViaDirect,
       signalingReconnects: sig.reconnectCount,
       udpChunkPayloadBytes: udpChan?.chunkPayloadBytes,
+      ignoredPaths: sourceScan.ignoredPathCount,
+      ignoreFilesLoaded: sourceScan.ignoreFilesLoaded,
     };
   } finally {
     directAbort.abort();
@@ -1433,6 +1513,7 @@ async function runTargetSession(params: {
   const { options, sessionId, wsUrl, stunServers, edgeRelays } = params;
   const sig = await SignalingClient.connect(wsUrl, {
     reconnectBudgetMs: options.signalingReconnectBudgetMs,
+    maxMessageBytes: options.maxSignalingMessageBytes,
   });
   sig.onReconnect = (n) =>
     options.onProgress?.({ phase: "signaling_resumed", detail: `reconnects=${n}` });
@@ -1672,6 +1753,8 @@ async function runTargetSession(params: {
       manifest: plan.manifest,
       rootTreeDigest: plan.rootTreeDigest,
       existingBlobs,
+      ignoreSpec: plan.ignoreSpec,
+      deleteIgnored: options.deleteIgnored,
     });
     await materializer.prepareStaging();
 
@@ -1927,7 +2010,15 @@ async function runTargetSession(params: {
 
     unsubTransfer();
 
-    const { committedFiles } = await materializer.commit();
+    const { committedFiles, preservedIgnoredPaths, preserveFailures, retainedBackupDir } =
+      await materializer.commit();
+    if (preserveFailures.length > 0) {
+      options.onProgress?.({
+        phase: "preserve_ignored_failed",
+        tier: selectedTier,
+        detail: `${preserveFailures.length} ignored path(s) could not be carried over; previous tree kept at ${retainedBackupDir}`,
+      });
+    }
     const committedDonePromise = sig.waitFor("session_committed", 15_000);
     sig.send({
       type: "report_target_committed",
@@ -1948,6 +2039,9 @@ async function runTargetSession(params: {
       packsApplied: appliedPackIds.size,
       firstPackAppliedAtMs,
       durationMs: Date.now() - startedAt,
+      preservedIgnoredPaths,
+      preserveFailures,
+      retainedBackupDir,
     };
   } catch (err) {
     await materializer?.abort();

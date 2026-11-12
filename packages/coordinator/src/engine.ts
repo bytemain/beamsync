@@ -828,6 +828,7 @@ export class CoordinatorEngine {
           selectedEdgeRelayRegion: msg.selectedEdgeRelayRegion,
           directUpgradePending: msg.directUpgradePending,
           directChannel: msg.directChannel,
+          ignoreSpec: msg.ignoreSpec,
         });
         break;
       }
