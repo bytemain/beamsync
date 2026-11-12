@@ -333,7 +333,7 @@ describe("Networking Stack Primitives (NIC Discovery, Happy Eyeballs, Multi-STUN
     }
   });
 
-  it("enforces token-bucket bandwidth pacing (maxBandwidthMbps) while preserving bit-exact delivery", async () => {
+  it("enforces maxBandwidthMbps on every network tier (direct, stream relay, R2) but not on same-host IPC, with bit-exact delivery", async () => {
     server = await startBeamSyncServer({
       port: 0,
       host: "127.0.0.1",
@@ -342,32 +342,64 @@ describe("Networking Stack Primitives (NIC Discovery, Happy Eyeballs, Multi-STUN
     });
 
     const sourceDir = path.join(tmpRoot, "src");
-    const targetDir = path.join(tmpRoot, "dst");
     await mkdir(sourceDir, { recursive: true });
-    // Incompressible random 300 KiB payload -> ~2.4 megabits on wire
+    // Incompressible 300 KiB payload: at 2 Mbps (250 kB/s) the wire bytes need ~1.2s
     const randomBlob = crypto.randomBytes(300 * 1024);
     await writeFile(path.join(sourceDir, "random.bin"), randomBlob);
 
-    const phrase = "bandwidth-pacer-test";
-    const t0 = performance.now();
-    await Promise.all([
-      sendDirectory({
-        serverUrl: server.httpUrl,
-        sourceDir,
-        customSecretWords: phrase,
-        targetPackBytes: 64 * 1024, // ~5 packs so pacing triggers across batches
-        maxBandwidthMbps: 8, // 8 Mbps = 1 MB/s -> 300 KiB must take >= ~220ms
-      }),
-      receiveDirectory({
-        serverUrl: server.httpUrl,
-        targetDir,
-        pairingCode: phrase,
-      }),
-    ]);
-    const elapsedMs = performance.now() - t0;
+    let runIndex = 0;
+    async function timedTransfer(
+      extra: Partial<Parameters<typeof sendDirectory>[0]>,
+      targetExtra: Partial<Parameters<typeof receiveDirectory>[0]> = {},
+    ) {
+      const phrase = `bandwidth-pacer-test-${runIndex++}`;
+      const targetDir = path.join(tmpRoot, `dst-${runIndex}`);
+      const t0 = performance.now();
+      const [tx] = await Promise.all([
+        sendDirectory({
+          serverUrl: server!.httpUrl,
+          sourceDir,
+          customSecretWords: phrase,
+          ...extra,
+        }),
+        receiveDirectory({
+          serverUrl: server!.httpUrl,
+          targetDir,
+          pairingCode: phrase,
+          ...targetExtra,
+        }),
+      ]);
+      const elapsedMs = performance.now() - t0;
+      const copied = await readFile(path.join(targetDir, "random.bin"));
+      expect(copied.equals(randomBlob)).toBe(true);
+      return { tier: tx.selectedTier, elapsedMs };
+    }
 
-    expect(elapsedMs).toBeGreaterThanOrEqual(180);
-    const copied = await readFile(path.join(targetDir, "random.bin"));
-    expect(copied.equals(randomBlob)).toBe(true);
+    const loopbackTcp = {
+      disableLocalIpc: true,
+      disableP2pUdp: true,
+      allowLoopbackTcpForTest: true,
+      hostIdOverride: "pace-host-a",
+    };
+    const loopbackTcpTarget = { ...loopbackTcp, hostIdOverride: "pace-host-b" };
+
+    for (const [expectedTier, extra, targetExtra] of [
+      ["STREAM_RELAY", { forceTier: "STREAM_RELAY" }, {}],
+      ["R2_PIPELINE", { forceTier: "R2_PIPELINE" }, {}],
+      ["P2P_DIRECT", loopbackTcp, loopbackTcpTarget],
+    ] as const) {
+      const unpaced = await timedTransfer(extra, targetExtra);
+      const paced = await timedTransfer({ ...extra, maxBandwidthMbps: 2 }, targetExtra);
+      expect(unpaced.tier).toBe(expectedTier);
+      expect(paced.tier).toBe(expectedTier);
+      // 307 kB at 250 kB/s minus the 50 ms burst credit is ~1.18s; unpaced loopback takes ~0.1s
+      expect(paced.elapsedMs, `${expectedTier} paced`).toBeGreaterThanOrEqual(1000);
+      expect(paced.elapsedMs - unpaced.elapsedMs, `${expectedTier} delta`).toBeGreaterThanOrEqual(700);
+    }
+
+    // Same-host IPC never leaves the machine, so the bandwidth cap is intentionally not applied
+    const ipc = await timedTransfer({ maxBandwidthMbps: 2 });
+    expect(ipc.tier).toBe("LOCAL_IPC");
+    expect(ipc.elapsedMs).toBeLessThan(900);
   });
 });

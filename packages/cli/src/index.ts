@@ -7,3 +7,6 @@ export * from "./framedStream.js";
 export * from "./udpHolePunch.js";
 export * from "./edgeRelayChannel.js";
 export * from "./syncClient.js";
+export * from "./proxy.js";
+export * from "./httpClient.js";
+export * from "./portMapping.js";

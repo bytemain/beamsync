@@ -53,7 +53,21 @@ interface PeerRuntimeState {
   candidates: EndpointCandidate[];
   relayRttMs?: Record<string, number>;
   natMapping?: NatMappingBehavior;
+  /** Reliable signaling: next/last Coordinator -> peer sequence number. */
+  outSeq: number;
+  /** Un-acknowledged Coordinator -> peer messages kept for replay on resume. */
+  outLog: Array<{ seq: number; payload: string }>;
+  outLogBytes: number;
+  /** Lowest sequence number still replayable (older entries were evicted or acked). */
+  outLogFloor: number;
+  /** Highest client sequence number already processed (replay deduplication). */
+  lastClientSeq: number;
+  /** Armed while this peer has no signaling socket; fires PEER_LOST to the other peer. */
+  lossTimer: ReturnType<typeof setTimeout> | null;
 }
+
+/** Upper bound of buffered un-acked signaling bytes per peer before old entries are evicted. */
+const MAX_PEER_REPLAY_LOG_BYTES = 64 * 1024 * 1024;
 
 export interface SessionRuntimeRecord {
   sessionId: string;
@@ -93,12 +107,18 @@ export interface CoordinatorEngineOptions {
   casTtlMs?: number;
   pairingTtlMs?: number;
   sessionTtlMs?: number;
+  /**
+   * How long a peer may stay without a signaling socket mid-session before the other peer is
+   * told `PEER_LOST`. Must exceed the client reconnect budget (30 s). Default 45 s.
+   */
+  peerLossGraceMs?: number;
   persistence?: CoordinatorPersistenceHook;
 }
 
 const DEFAULT_CAS_TTL_MS = 14 * 24 * 60 * 60 * 1000; // 14 days sliding TTL
 const DEFAULT_PAIRING_TTL_MS = 10 * 60 * 1000; // 10 minutes
 const DEFAULT_SESSION_TTL_MS = 2 * 60 * 60 * 1000; // 2 hours
+const DEFAULT_PEER_LOSS_GRACE_MS = 45 * 1000;
 const DEFAULT_EDGE_RELAY_TTL_MS = 60 * 1000; // 60s dynamic heartbeat TTL
 
 export class CoordinatorEngine {
@@ -109,6 +129,7 @@ export class CoordinatorEngine {
   private readonly casTtlMs: number;
   private readonly pairingTtlMs: number;
   private readonly sessionTtlMs: number;
+  private readonly peerLossGraceMs: number;
   private readonly persistence?: CoordinatorPersistenceHook;
 
   private slotCounter = 100;
@@ -128,6 +149,7 @@ export class CoordinatorEngine {
     this.casTtlMs = options.casTtlMs ?? DEFAULT_CAS_TTL_MS;
     this.pairingTtlMs = options.pairingTtlMs ?? DEFAULT_PAIRING_TTL_MS;
     this.sessionTtlMs = options.sessionTtlMs ?? DEFAULT_SESSION_TTL_MS;
+    this.peerLossGraceMs = options.peerLossGraceMs ?? DEFAULT_PEER_LOSS_GRACE_MS;
     this.persistence = options.persistence;
 
     for (const r of options.initialEdgeRelays ?? []) {
@@ -354,12 +376,24 @@ export class CoordinatorEngine {
         socket: null,
         helloReceived: false,
         candidates: [],
+        outSeq: 0,
+        outLog: [],
+        outLogBytes: 0,
+        outLogFloor: 1,
+        lastClientSeq: 0,
+        lossTimer: null,
       },
       target: {
         token: targetToken,
         socket: null,
         helloReceived: false,
         candidates: [],
+        outSeq: 0,
+        outLog: [],
+        outLogBytes: 0,
+        outLogFloor: 1,
+        lastClientSeq: 0,
+        lossTimer: null,
       },
       receipts: new Map(),
       ephemeralStorageKeys: new Set(),
@@ -459,12 +493,24 @@ export class CoordinatorEngine {
         socket: null,
         helloReceived: false,
         candidates: [],
+        outSeq: 0,
+        outLog: [],
+        outLogBytes: 0,
+        outLogFloor: 1,
+        lastClientSeq: 0,
+        lossTimer: null,
       },
       target: {
         token: targetToken,
         socket: null,
         helloReceived: false,
         candidates: [],
+        outSeq: 0,
+        outLog: [],
+        outLogBytes: 0,
+        outLogFloor: 1,
+        lastClientSeq: 0,
+        lossTimer: null,
       },
       receipts: new Map(),
       ephemeralStorageKeys: new Set(),
@@ -490,9 +536,54 @@ export class CoordinatorEngine {
     if (!session) return;
     if (session.source.socket === socket) {
       session.source.socket = null;
+      this.armPeerLossTimer(session, session.source, session.target, "source");
     }
     if (session.target.socket === socket) {
       session.target.socket = null;
+      this.armPeerLossTimer(session, session.target, session.source, "target");
+    }
+  }
+
+  /**
+   * A peer whose signaling socket is gone gets a grace period to resume. If it does not come
+   * back, the surviving peer is told so it can fail fast instead of waiting forever.
+   */
+  private armPeerLossTimer(
+    session: SessionRuntimeRecord,
+    lost: PeerRuntimeState,
+    survivor: PeerRuntimeState,
+    lostRole: "source" | "target",
+  ): void {
+    if (lost.lossTimer) clearTimeout(lost.lossTimer);
+    lost.lossTimer = null;
+    if (
+      !lost.helloReceived ||
+      !survivor.helloReceived ||
+      session.state === "committed" ||
+      session.state === "failed"
+    ) {
+      return;
+    }
+    lost.lossTimer = setTimeout(() => {
+      lost.lossTimer = null;
+      if (lost.socket || session.state === "committed" || session.state === "failed") return;
+      session.state = "failed";
+      this.sendToPeer(survivor, {
+        type: "session_error",
+        code: "PEER_LOST",
+        message: `The ${lostRole} peer disconnected and did not resume within ${this.peerLossGraceMs} ms`,
+      });
+    }, this.peerLossGraceMs);
+    lost.lossTimer.unref?.();
+  }
+
+  /** Cancels pending timers (call when shutting the Coordinator down). */
+  dispose(): void {
+    for (const session of this.sessions.values()) {
+      for (const peer of [session.source, session.target]) {
+        if (peer.lossTimer) clearTimeout(peer.lossTimer);
+        peer.lossTimer = null;
+      }
     }
   }
 
@@ -512,6 +603,17 @@ export class CoordinatorEngine {
       return;
     }
 
+    // Sliding TTL: once both peers are paired, any signaling traffic (including the 20 s
+    // keepalive pings) keeps the session alive, so a multi-hour migration is never
+    // garbage-collected mid-transfer. An unjoined pairing still expires on its own TTL.
+    if (
+      session.state !== "awaiting_peer" &&
+      session.state !== "committed" &&
+      session.state !== "failed"
+    ) {
+      session.expiresAt = Math.max(session.expiresAt, Date.now() + this.sessionTtlMs);
+    }
+
     let msg: ClientToServerWsMessage;
     try {
       msg = JSON.parse(rawMessage) as ClientToServerWsMessage;
@@ -525,7 +627,21 @@ export class CoordinatorEngine {
     }
 
     if (msg.type === "ping") {
-      this.sendTo(socket, { type: "pong", ts: msg.ts });
+      const pingRole = this.identifyRole(session, socket);
+      const pingPeer =
+        pingRole === "source"
+          ? session.source
+          : pingRole === "target"
+            ? session.target
+            : null;
+      if (pingPeer && typeof msg.ackSeq === "number") {
+        this.trimReplayLog(pingPeer, msg.ackSeq);
+      }
+      this.sendTo(socket, {
+        type: "pong",
+        ts: msg.ts,
+        ackSeq: pingPeer?.lastClientSeq,
+      });
       return;
     }
 
@@ -541,7 +657,65 @@ export class CoordinatorEngine {
         return;
       }
 
+      if (typeof msg.resumeFromSeq === "number") {
+        // Re-attach after a dropped signaling socket (roaming, Wi-Fi <-> LTE, proxy idle reset):
+        // keep all negotiated session state and replay whatever the peer missed.
+        if (!peerState.helloReceived) {
+          this.sendTo(socket, {
+            type: "session_error",
+            code: "RESUME_UNKNOWN_PEER",
+            message: "Cannot resume a peer that never attached",
+          });
+          socket.close(1008, "RESUME_UNKNOWN_PEER");
+          return;
+        }
+        this.trimReplayLog(peerState, msg.resumeFromSeq);
+        if (msg.resumeFromSeq + 1 < peerState.outLogFloor) {
+          this.sendTo(socket, {
+            type: "session_error",
+            code: "RESUME_GAP",
+            message: "Replay window no longer covers the requested sequence",
+          });
+          socket.close(1008, "RESUME_GAP");
+          return;
+        }
+        const previous = peerState.socket;
+        peerState.socket = socket;
+        if (peerState.lossTimer) {
+          clearTimeout(peerState.lossTimer);
+          peerState.lossTimer = null;
+        }
+        if (previous && previous !== socket) {
+          try {
+            previous.close(1012, "superseded_by_resume");
+          } catch {
+            // Old socket is already gone
+          }
+        }
+        this.sendTo(socket, {
+          type: "resumed",
+          lastClientSeq: peerState.lastClientSeq,
+        });
+        for (const entry of peerState.outLog) {
+          try {
+            socket.send(entry.payload);
+          } catch {
+            break;
+          }
+        }
+        return;
+      }
+
+      // Fresh attach: nothing sent before this point can be replayed to a brand-new client.
+      peerState.outLog = [];
+      peerState.outLogBytes = 0;
+      peerState.outLogFloor = peerState.outSeq + 1;
+      peerState.lastClientSeq = 0;
       peerState.socket = socket;
+      if (peerState.lossTimer) {
+        clearTimeout(peerState.lossTimer);
+        peerState.lossTimer = null;
+      }
       peerState.helloReceived = true;
       if (msg.pakePublicHex) {
         peerState.pakePublicHex = msg.pakePublicHex;
@@ -578,6 +752,16 @@ export class CoordinatorEngine {
         message: "Send hello before session messages",
       });
       return;
+    }
+
+    // Reliable signaling: drop client messages that were already processed before a reconnect.
+    const callerPeer = callerRole === "source" ? session.source : session.target;
+    const cseq = (msg as { cseq?: unknown }).cseq;
+    if (typeof cseq === "number") {
+      if (cseq <= callerPeer.lastClientSeq) {
+        return;
+      }
+      callerPeer.lastClientSeq = cseq;
     }
 
     switch (msg.type) {
@@ -642,6 +826,30 @@ export class CoordinatorEngine {
           missingBytesEstimate: msg.missingBytesEstimate,
           selectedTier: msg.selectedTier,
           selectedEdgeRelayRegion: msg.selectedEdgeRelayRegion,
+          directUpgradePending: msg.directUpgradePending,
+          directChannel: msg.directChannel,
+        });
+        break;
+      }
+
+      case "direct_upgrade_offer": {
+        if (callerRole !== "source") return;
+        this.sendToPeer(session.target, {
+          type: "direct_upgrade_offer",
+          channel: msg.channel,
+        });
+        break;
+      }
+
+      case "direct_upgrade_answer": {
+        if (callerRole !== "target") return;
+        if (msg.accepted && session.selectedTier === "EDGE_RELAY") {
+          session.selectedTier = "P2P_DIRECT";
+        }
+        this.sendToPeer(session.source, {
+          type: "direct_upgrade_answer",
+          channel: msg.channel,
+          accepted: msg.accepted,
         });
         break;
       }
@@ -1046,8 +1254,43 @@ export class CoordinatorEngine {
     peer: PeerRuntimeState,
     msg: ServerToClientWsMessage,
   ): void {
+    // Every peer-directed message is sequenced and retained until acknowledged so a
+    // peer whose signaling socket dropped can resume without losing control events.
+    const seq = ++peer.outSeq;
+    const payload = JSON.stringify({ ...msg, sseq: seq });
+    peer.outLog.push({ seq, payload });
+    peer.outLogBytes += payload.length;
+    while (
+      peer.outLogBytes > MAX_PEER_REPLAY_LOG_BYTES &&
+      peer.outLog.length > 1
+    ) {
+      const evicted = peer.outLog.shift()!;
+      peer.outLogBytes -= evicted.payload.length;
+      peer.outLogFloor = evicted.seq + 1;
+    }
     if (peer.socket) {
-      this.sendTo(peer.socket, msg);
+      try {
+        peer.socket.send(payload);
+      } catch {
+        // Closed socket race; the entry stays in the replay log for resume
+      }
+    }
+  }
+
+  private trimReplayLog(peer: PeerRuntimeState, ackSeq: number): void {
+    let dropCount = 0;
+    while (
+      dropCount < peer.outLog.length &&
+      peer.outLog[dropCount].seq <= ackSeq
+    ) {
+      peer.outLogBytes -= peer.outLog[dropCount].payload.length;
+      dropCount++;
+    }
+    if (dropCount > 0) {
+      peer.outLog.splice(0, dropCount);
+    }
+    if (ackSeq + 1 > peer.outLogFloor) {
+      peer.outLogFloor = Math.min(ackSeq + 1, peer.outSeq + 1);
     }
   }
 

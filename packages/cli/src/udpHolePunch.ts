@@ -8,6 +8,12 @@ import {
   type NatMappingBehavior,
 } from "@beamsync/protocol";
 import { listLanIpv4Addresses } from "./framedStream.js";
+import {
+  acquirePortMapping,
+  type ActivePortMapping,
+  type NatPmpMapping,
+  type PortMappingGateway,
+} from "./portMapping.js";
 import { classifyNatMappingBehavior } from "./stunClient.js";
 
 const UDP_MAGIC = new Uint8Array([0x42, 0x4d, 0x55, 0x31]); // "BMU1"
@@ -20,7 +26,20 @@ const PKT_PACK_DONE_ACK = 0x13;
 const PKT_STREAM_FIN = 0x1f;
 const PKT_STREAM_FIN_ACK = 0x20;
 
-const CHUNK_PAYLOAD_BYTES = 1150; // Safe below standard 1280/1500 UDP MTU
+const PKT_KEEPALIVE = 0x30;
+const PKT_MTU_PROBE = 0x31;
+const PKT_MTU_PROBE_ACK = 0x32;
+
+/** Conservative chunk payload that fits a 1280-byte path MTU (IPv6 minimum / most tunnels). */
+export const DEFAULT_UDP_CHUNK_PAYLOAD_BYTES = 1150;
+/**
+ * Larger payload sizes tried by path-MTU probing, biggest first. Each maps to an IPv4 packet of
+ * `payload + 73` bytes (20 IP + 8 UDP + 4 magic + 28 AEAD + 1 type + 12 chunk header):
+ * 1420 -> 1493 (Ethernet/PPPoE), 1340 -> 1413 (WireGuard-style 1420 tunnels), 1232 -> 1305.
+ */
+export const UDP_MTU_PROBE_PAYLOAD_SIZES = [1420, 1380, 1340, 1300, 1232];
+const CHUNK_HEADER_BYTES = 12;
+const UDP_KEEPALIVE_INTERVAL_MS = 5_000;
 const INITIAL_CWND_CHUNKS = 64;
 const MIN_CWND_CHUNKS = 32;
 const MAX_CWND_CHUNKS = 256; // ~294 KiB max in-flight window per pack stream
@@ -31,12 +50,23 @@ export interface PreparedUdpPunchEndpoint {
   natMapping: NatMappingBehavior;
   portStride: number;
   hasSequentialPrediction: boolean;
+  /** Gateway port mapping (NAT-PMP) held for this socket, if the router granted one. */
+  portMapping: NatPmpMapping | null;
   close(): Promise<void>;
+}
+
+export interface UdpPortMappingOptions {
+  /** Skip the gateway port-mapping request entirely. */
+  disabled?: boolean;
+  /** Explicit NAT-PMP gateway (otherwise the default IPv4 gateway is discovered). */
+  gateway?: PortMappingGateway;
+  timeoutMs?: number;
 }
 
 export async function prepareUdpPunchEndpoint(
   stunServers: string[],
   includeLoopbackForTest = false,
+  portMappingOptions: UdpPortMappingOptions = {},
 ): Promise<PreparedUdpPunchEndpoint> {
   const socket = dgram.createSocket("udp4");
   await new Promise<void>((resolve, reject) => {
@@ -59,6 +89,17 @@ export async function prepareUdpPunchEndpoint(
     seen.add(key);
     candidates.push({ kind: "udp_punch", address: ip, port });
   };
+
+  // Ask the gateway for an explicit port mapping while STUN runs, so a router that does not
+  // speak NAT-PMP costs no extra time on top of NAT classification.
+  const portMappingPromise: Promise<ActivePortMapping | null> = portMappingOptions.disabled
+    ? Promise.resolve(null)
+    : acquirePortMapping({
+        protocol: "udp",
+        internalPort: localPort,
+        gateway: portMappingOptions.gateway,
+        timeoutMs: portMappingOptions.timeoutMs ?? 250,
+      }).catch(() => null);
 
   // Query up to 2 STUN servers on the exact same bound UDP socket to preserve NAT port mapping
   // AND classify Endpoint-Independent (Cone) vs Symmetric NAT + sequential port stride.
@@ -96,20 +137,46 @@ export async function prepareUdpPunchEndpoint(
     addCandidate("127.0.0.1", localPort);
   }
 
+  // Hole punching already works behind an endpoint-independent NAT, so there the mapping is
+  // not waited for (and is handed back if the gateway grants it later). Behind a symmetric NAT,
+  // or when STUN gave no verdict, the mapped endpoint is the one stable public ip:port the
+  // peer can dial.
+  let portMapping: ActivePortMapping | null = null;
+  if (natInfo.natMapping === "endpoint_independent") {
+    void portMappingPromise.then((m) => m?.release().catch(() => {}));
+  } else {
+    portMapping = await portMappingPromise;
+    if (portMapping) {
+      const key = `${portMapping.mapping.externalIp}:${portMapping.mapping.externalPort}`;
+      if (!seen.has(key)) {
+        seen.add(key);
+        // First in the list: the mapped endpoint is the most likely one to be reachable
+        candidates.unshift({
+          kind: "udp_punch",
+          address: portMapping.mapping.externalIp,
+          port: portMapping.mapping.externalPort,
+        });
+      }
+    }
+  }
+
   return {
     socket,
     candidates,
     natMapping: natInfo.natMapping,
     portStride: natInfo.portStride,
     hasSequentialPrediction,
-    close: () =>
-      new Promise<void>((resolve) => {
+    portMapping: portMapping?.mapping ?? null,
+    close: async () => {
+      await portMapping?.release().catch(() => {});
+      await new Promise<void>((resolve) => {
         try {
           socket.close(() => resolve());
         } catch {
           resolve();
         }
-      }),
+      });
+    },
   };
 }
 
@@ -121,6 +188,11 @@ export class UdpHolePunchChannel {
   private peerPort: number;
   private closed = false;
   private srttMs = 40;
+  private keepaliveTimer: ReturnType<typeof setInterval> | null = null;
+  private lastSendAt = 0;
+  private outboundFilter: ((datagramBytes: number) => boolean) | null = null;
+  /** Payload bytes per data chunk; raised by `probeUdpPathPayloadSize` when the path allows. */
+  chunkPayloadBytes = DEFAULT_UDP_CHUNK_PAYLOAD_BYTES;
   private readonly listeners = new Set<
     (pktType: number, body: Uint8Array, rinfo: dgram.RemoteInfo) => void
   >();
@@ -171,7 +243,13 @@ export class UdpHolePunchChannel {
       this.peerPort = rinfo.port;
       const pktType = plain[0];
       const body = plain.subarray(1);
-      for (const fn of this.listeners) {
+      // Keepalives carry no payload but still reach listeners so receivers count them as liveness
+      if (pktType === PKT_MTU_PROBE && body.length >= 2) {
+        // Echo the probed payload size back in a tiny datagram that always fits
+        this.sendEncrypted(PKT_MTU_PROBE_ACK, body.subarray(0, 2));
+        return;
+      }
+      for (const fn of [...this.listeners]) {
         fn(pktType, body, rinfo);
       }
     } catch {
@@ -189,7 +267,38 @@ export class UdpHolePunchChannel {
     const inner = concatBytes(new Uint8Array([pktType & 0xff]), body);
     const sealed = aeadEncrypt(this.transportKey, inner, this.sessionAad);
     const wire = Buffer.from(concatBytes(UDP_MAGIC, sealed));
-    this.socket.send(wire, port, addr);
+    if (this.outboundFilter && !this.outboundFilter(wire.length)) {
+      return; // simulated path drop (tests)
+    }
+    this.lastSendAt = Date.now();
+    try {
+      this.socket.send(wire, port, addr, () => {});
+    } catch {
+      // Socket already closed during teardown
+    }
+  }
+
+  /**
+   * Keeps the NAT pinhole open while the channel is established but idle (for example
+   * while the session is still streaming over an Edge Relay before a hot upgrade).
+   */
+  startKeepalive(): void {
+    if (this.keepaliveTimer || this.closed) return;
+    // Checked every second so the gap between datagrams never exceeds ~UDP_KEEPALIVE_INTERVAL_MS,
+    // well inside the receiver's 10 s inactivity timeout (e.g. while the sender is being paced).
+    this.keepaliveTimer = setInterval(() => {
+      if (Date.now() - this.lastSendAt >= UDP_KEEPALIVE_INTERVAL_MS - 1000) {
+        this.sendEncrypted(PKT_KEEPALIVE, new Uint8Array(0));
+      }
+    }, 1000);
+    this.keepaliveTimer.unref();
+  }
+
+  /** Test hook: return `false` to drop an outbound datagram of the given size (simulated MTU). */
+  setOutboundDatagramFilterForTest(
+    filter: ((datagramBytes: number) => boolean) | null,
+  ): void {
+    this.outboundFilter = filter;
   }
 
   onPacket(
@@ -201,6 +310,10 @@ export class UdpHolePunchChannel {
 
   destroy(): void {
     this.closed = true;
+    if (this.keepaliveTimer) {
+      clearInterval(this.keepaliveTimer);
+      this.keepaliveTimer = null;
+    }
     this.socket.off("message", this.onRawDatagram);
   }
 }
@@ -217,6 +330,8 @@ export async function establishUdpHolePunch(params: {
   sessionId: string;
   peerUdpCandidates: EndpointCandidate[];
   timeoutMs?: number;
+  /** Cancels a long-running background punch (session finished or path no longer needed). */
+  signal?: AbortSignal;
 }): Promise<UdpHolePunchChannel> {
   const udpCands = params.peerUdpCandidates.filter(
     (c) => c.kind === "udp_punch" && c.port,
@@ -244,18 +359,21 @@ export async function establishUdpHolePunch(params: {
     const finishOk = () => {
       if (settled) return;
       settled = true;
-      channel.updateRttSample(performance.now() - punchStartedAt);
-      clearInterval(probeInterval);
+      channel.updateRttSample(Math.min(400, performance.now() - punchStartedAt));
+      clearTimeout(probeTimer);
       clearTimeout(timer);
+      params.signal?.removeEventListener("abort", onAbort);
       unsub();
+      channel.startKeepalive();
       resolve(channel);
     };
 
     const finishErr = (err: Error) => {
       if (settled) return;
       settled = true;
-      clearInterval(probeInterval);
+      clearTimeout(probeTimer);
       clearTimeout(timer);
+      params.signal?.removeEventListener("abort", onAbort);
       unsub();
       channel.destroy();
       reject(err);
@@ -311,13 +429,80 @@ export async function establishUdpHolePunch(params: {
       }
     };
 
+    const onAbort = () => finishErr(new Error("UDP hole punch aborted"));
+    if (params.signal?.aborted) {
+      queueMicrotask(onAbort);
+    } else {
+      params.signal?.addEventListener("abort", onAbort, { once: true });
+    }
+
+    // Aggressive 50ms probing for the first 2s, then 250ms so a long background punch
+    // (kept alive while data already flows over an Edge Relay) stays cheap.
+    let probeTimer: ReturnType<typeof setTimeout>;
+    const scheduleProbe = () => {
+      const elapsed = performance.now() - punchStartedAt;
+      probeTimer = setTimeout(() => {
+        if (settled) return;
+        fireProbes();
+        scheduleProbe();
+      }, elapsed < 2000 ? 50 : 250);
+    };
     fireProbes();
-    const probeInterval = setInterval(fireProbes, 50);
+    scheduleProbe();
     const timer = setTimeout(
       () => finishErr(new Error("UDP hole punch timed out")),
       timeoutMs,
     );
   });
+}
+
+/**
+ * Probe-based path payload sizing (in the spirit of RFC 8899 DPLPMTUD, search-down only).
+ * Sends padded probes for every candidate size, waits for authenticated echoes, and raises
+ * `channel.chunkPayloadBytes` to the largest size that survived the path. If nothing larger
+ * gets through, the conservative 1150-byte default is kept, so probing can only help.
+ */
+export async function probeUdpPathPayloadSize(
+  channel: UdpHolePunchChannel,
+  opts: { candidates?: number[]; rounds?: number; waitMs?: number } = {},
+): Promise<number> {
+  const candidates = [...(opts.candidates ?? UDP_MTU_PROBE_PAYLOAD_SIZES)]
+    .filter((n) => n > DEFAULT_UDP_CHUNK_PAYLOAD_BYTES && n <= 8192)
+    .sort((a, b) => b - a);
+  if (candidates.length === 0) return channel.chunkPayloadBytes;
+
+  const rounds = Math.max(1, opts.rounds ?? 3);
+  const waitMs = opts.waitMs ?? Math.max(120, Math.min(600, channel.getAdaptiveRtoMs() * 2));
+  const confirmed = new Set<number>();
+
+  const unsub = channel.onPacket((pktType, body) => {
+    if (pktType === PKT_MTU_PROBE_ACK && body.length >= 2) {
+      confirmed.add((body[0] << 8) | body[1]);
+    }
+  });
+
+  try {
+    for (let round = 0; round < rounds; round++) {
+      for (const size of candidates) {
+        if (confirmed.has(size)) continue;
+        // Same on-wire size as a full data chunk carrying `size` payload bytes
+        const probe = new Uint8Array(CHUNK_HEADER_BYTES + size);
+        probe[0] = (size >> 8) & 0xff;
+        probe[1] = size & 0xff;
+        channel.sendEncrypted(PKT_MTU_PROBE, probe);
+      }
+      await new Promise((r) => setTimeout(r, Math.ceil(waitMs / rounds)));
+      if (confirmed.has(candidates[0])) break;
+    }
+  } finally {
+    unsub();
+  }
+
+  const best = candidates.find((size) => confirmed.has(size));
+  if (best !== undefined) {
+    channel.chunkPayloadBytes = best;
+  }
+  return channel.chunkPayloadBytes;
 }
 
 export async function sendPackOverUdp(
@@ -326,9 +511,12 @@ export async function sendPackOverUdp(
   packId: string,
   wireBytes: Uint8Array,
 ): Promise<void> {
+  // Snapshot per pack: the receiver reassembles by chunk index, so the size only has
+  // to stay constant within one pack and may differ between packs.
+  const chunkPayloadBytes = channel.chunkPayloadBytes;
   const totalChunks = Math.max(
     1,
-    Math.ceil(wireBytes.length / CHUNK_PAYLOAD_BYTES),
+    Math.ceil(wireBytes.length / chunkPayloadBytes),
   );
   const acked = new Uint8Array(totalChunks);
   const firstSentAt = new Float64Array(totalChunks);
@@ -423,8 +611,8 @@ export async function sendPackOverUdp(
     });
 
     const sendChunk = (idx: number) => {
-      const start = idx * CHUNK_PAYLOAD_BYTES;
-      const end = Math.min(wireBytes.length, start + CHUNK_PAYLOAD_BYTES);
+      const start = idx * chunkPayloadBytes;
+      const end = Math.min(wireBytes.length, start + chunkPayloadBytes);
       const slice = wireBytes.subarray(start, end);
       const header = new Uint8Array(12);
       const dv = new DataView(header.buffer);

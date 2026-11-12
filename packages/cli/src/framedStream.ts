@@ -214,6 +214,8 @@ export async function createTargetDirectListeners(params: {
   transportKey: Uint8Array;
   enableLocalIpc: boolean;
   enableLanTcp: boolean;
+  /** Test hook: advertise 127.0.0.1 as a `lan_tcp` candidate on hosts without a LAN NIC. */
+  includeLoopbackTcpForTest?: boolean;
   rejectedAttemptCounter?: { count: number };
 }): Promise<TargetDirectListeners> {
   const candidates: EndpointCandidate[] = [];
@@ -229,11 +231,15 @@ export async function createTargetDirectListeners(params: {
     kind: EndpointCandidate["kind"];
   }) => void) | null = null;
 
+  const acceptedSockets = new Set<net.Socket>();
+
   const acceptSocket = (
     rawSock: net.Socket,
     kind: EndpointCandidate["kind"],
   ) => {
     const ch = new FramedSocketChannel(rawSock);
+    acceptedSockets.add(rawSock);
+    rawSock.once("close", () => acceptedSockets.delete(rawSock));
     void authenticateServerChannel(ch, params.transportKey, params.sessionId)
       .then(() => {
         if (resolvedChannel) {
@@ -305,6 +311,14 @@ export async function createTargetDirectListeners(params: {
 
   if (params.enableLanTcp) {
     const discovered = discoverDirectIpAddresses();
+    if (params.includeLoopbackTcpForTest) {
+      discovered.push({
+        address: "127.0.0.1",
+        family: 4,
+        category: "lan",
+        interfaceName: "lo",
+      });
+    }
     const ipv4List = discovered.filter((d) => d.family === 4);
     const ipv6List = discovered.filter((d) => d.family === 6);
 
@@ -379,6 +393,12 @@ export async function createTargetDirectListeners(params: {
       });
     },
     closeAll: async () => {
+      // Destroy accepted-but-unused direct sockets (for example a TCP path that won the
+      // race after the session already completed over an Edge Relay) so close() can finish.
+      for (const sock of acceptedSockets) {
+        sock.destroy();
+      }
+      acceptedSockets.clear();
       await Promise.all(
         servers.map(
           (srv) =>
@@ -495,7 +515,9 @@ export async function receivePacksFromSocket(
 ): Promise<void> {
   const decoder = new TextDecoder();
   while (true) {
-    const frame = await channel.nextFrame(30_000);
+    // Generous inter-pack wait: a bandwidth-capped sender may pause for a whole pack interval.
+    // A dead TCP peer is detected by the socket closing, not by this timer.
+    const frame = await channel.nextFrame(120_000);
     if (frame.type === FRAME_STREAM_END) {
       return;
     }

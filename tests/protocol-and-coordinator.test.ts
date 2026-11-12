@@ -218,4 +218,68 @@ describe("BeamSync protocol primitives & coordinator equilibrium", () => {
       }),
     ).toThrow(/PAIRING_NOT_FOUND/);
   });
+
+  it("slides the session TTL on signaling activity so a long transfer is not garbage-collected, and reports PEER_LOST once per vanished peer", async () => {
+    const engine = new CoordinatorEngine({
+      storageDriver: new R2PresignedStorageDriver({
+        accountId: "test",
+        bucket: "b",
+        accessKeyId: "a",
+        secretAccessKey: "s",
+      }),
+      sessionTtlMs: 300,
+      peerLossGraceMs: 80,
+    });
+    const created = engine.createPairingSession({ wsBaseUrl: "ws://localhost:8787" });
+    const joined = engine.joinPairingSession({
+      slotCode: created.slotCode,
+      wsBaseUrl: "ws://localhost:8787",
+    });
+    const inbox = { source: [] as Array<Record<string, unknown>>, target: [] as Array<Record<string, unknown>> };
+    const socketFor = (role: "source" | "target") => ({
+      send: (json: string) => inbox[role].push(JSON.parse(json) as Record<string, unknown>),
+      close: () => {},
+    });
+    const sourceSocket = socketFor("source");
+    const targetSocket = socketFor("target");
+    const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
+    const send = (socket: ReturnType<typeof socketFor>, msg: Record<string, unknown>) =>
+      engine.handleWsMessage(created.sessionId, socket, JSON.stringify(msg));
+
+    await send(sourceSocket, { type: "hello", role: "source", peerToken: created.peerToken });
+    await send(targetSocket, { type: "hello", role: "target", peerToken: joined.peerToken });
+    expect(inbox.source.some((m) => m.type === "peer_joined")).toBe(true);
+
+    // Keepalive pings for twice the TTL: the session must survive garbage collection
+    for (let i = 0; i < 6; i++) {
+      await sleep(100);
+      await send(sourceSocket, { type: "ping", ts: Date.now() });
+      expect((await engine.runGarbageCollection()).prunedSessions).toBe(0);
+    }
+
+    // The target drops and resumes inside the grace period: nobody is told anything
+    engine.detachSocket(created.sessionId, targetSocket);
+    await sleep(30);
+    const resumedTargetSocket = socketFor("target");
+    await send(resumedTargetSocket, {
+      type: "hello",
+      role: "target",
+      peerToken: joined.peerToken,
+      resumeFromSeq: 0,
+    });
+    await sleep(120);
+    expect(inbox.source.some((m) => m.type === "session_error")).toBe(false);
+
+    // The target drops for good: the source hears PEER_LOST after the grace period
+    engine.detachSocket(created.sessionId, resumedTargetSocket);
+    await sleep(160);
+    const errors = inbox.source.filter((m) => m.type === "session_error");
+    expect(errors).toHaveLength(1);
+    expect(errors[0].code).toBe("PEER_LOST");
+
+    // With no further activity the session finally expires
+    await sleep(350);
+    expect((await engine.runGarbageCollection()).prunedSessions).toBe(1);
+    engine.dispose();
+  });
 });

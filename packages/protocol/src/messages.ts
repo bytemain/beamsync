@@ -84,12 +84,32 @@ export type NatMappingBehavior =
   | "endpoint_independent"
   | "symmetric";
 
+/** Direct channel flavour offered when hot-upgrading from Edge Relay to P2P. */
+export type DirectUpgradeChannelKind = "tcp" | "udp";
+
+/**
+ * Reliable-signaling envelope fields added to every JSON control message
+ * except `hello`, `ping`, `pong`, and `resumed`.
+ *  - `cseq`: client -> Coordinator sequence number (deduplicated on replay)
+ *  - `sseq`: Coordinator -> client sequence number (replayed after `resumeFromSeq`)
+ */
+export interface SignalingEnvelopeFields {
+  cseq?: number;
+  sseq?: number;
+}
+
 export type ClientToServerWsMessage =
   | {
       type: "hello";
       role: "source" | "target";
       peerToken: string;
       pakePublicHex?: string;
+      /**
+       * Present only when re-attaching after a dropped signaling socket: the last
+       * server sequence number (`sseq`) this peer processed. The Coordinator replays
+       * everything after it and answers with `resumed`.
+       */
+      resumeFromSeq?: number;
     }
   | {
       type: "pake_confirm";
@@ -111,6 +131,10 @@ export type ClientToServerWsMessage =
       missingBytesEstimate: number;
       selectedTier: TransportTier;
       selectedEdgeRelayRegion?: string;
+      /** Source is still probing a direct path and may offer a mid-stream upgrade. */
+      directUpgradePending?: boolean;
+      /** Which direct channel the source will write to when `selectedTier` is `P2P_DIRECT`. */
+      directChannel?: DirectUpgradeChannelKind;
     }
   | {
       type: "transport_ready";
@@ -157,8 +181,19 @@ export type ClientToServerWsMessage =
       committedFiles: number;
     }
   | {
+      type: "direct_upgrade_offer";
+      channel: DirectUpgradeChannelKind;
+    }
+  | {
+      type: "direct_upgrade_answer";
+      channel: DirectUpgradeChannelKind;
+      accepted: boolean;
+    }
+  | {
       type: "ping";
       ts: number;
+      /** Highest server sequence number (`sseq`) processed by this peer. */
+      ackSeq?: number;
     };
 
 export type ServerToClientWsMessage =
@@ -188,6 +223,10 @@ export type ServerToClientWsMessage =
       missingBytesEstimate: number;
       selectedTier: TransportTier;
       selectedEdgeRelayRegion?: string;
+      /** Source is still probing a direct path and may offer a mid-stream upgrade. */
+      directUpgradePending?: boolean;
+      /** Which direct channel the source will write to when `selectedTier` is `P2P_DIRECT`. */
+      directChannel?: DirectUpgradeChannelKind;
     }
   | {
       type: "transport_ready";
@@ -242,8 +281,24 @@ export type ServerToClientWsMessage =
       message: string;
     }
   | {
+      type: "direct_upgrade_offer";
+      channel: DirectUpgradeChannelKind;
+    }
+  | {
+      type: "direct_upgrade_answer";
+      channel: DirectUpgradeChannelKind;
+      accepted: boolean;
+    }
+  | {
+      type: "resumed";
+      /** Highest client sequence number (`cseq`) the Coordinator has processed. */
+      lastClientSeq: number;
+    }
+  | {
       type: "pong";
       ts: number;
+      /** Highest client sequence number (`cseq`) the Coordinator has processed. */
+      ackSeq?: number;
     };
 
 export interface PackReceiptRow {

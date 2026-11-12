@@ -30,12 +30,25 @@ function printUsage(): void {
   console.log(`BeamSync CLI — streaming incremental directory sync & migration
 
 Usage:
-  beamsync send <source-dir> [--server <url>] [--scope <namespace>] [--code <words>] [--prefer-edge-relay] [--disable-edge-relay] [--max-mbps <mbps>] [--force-tier <tier>]
-  beamsync receive <target-dir> --code <pairing-code> [--server <url>] [--disable-edge-relay]
+  beamsync send <source-dir> [--server <url>] [--scope <namespace>] [--code <words>] [options]
+  beamsync receive <target-dir> --code <pairing-code> [--server <url>] [options]
   beamsync doctor [--server <url>]
+
+Send options:
+  --max-mbps <mbps>        Cap upload bandwidth on network tiers
+  --prefer-edge-relay      Use the Edge Relay regardless of transfer size
+  --force-tier <tier>      LOCAL_IPC | P2P_DIRECT | EDGE_RELAY | STREAM_RELAY | R2_PIPELINE
+  --no-optimistic-relay    Wait for direct-path probing instead of starting on the Edge Relay
+  --no-udp-mtu-probe       Keep conservative 1150-byte UDP chunks
+
+Options for both sides:
+  --disable-edge-relay     Never use an Edge Relay
+  --no-port-mapping        Do not ask the local gateway for a UDP port mapping (NAT-PMP)
 
 Environment:
   BEAMSYNC_SERVER_URL   Default coordinator server URL (default: http://127.0.0.1:8787)
+  BEAMSYNC_PROXY        Outbound proxy (http://, https://, socks5://); overrides HTTPS_PROXY / HTTP_PROXY / ALL_PROXY
+  BEAMSYNC_NO_PROXY     Hosts that bypass the proxy (same syntax as NO_PROXY)
 `);
 }
 
@@ -77,6 +90,9 @@ async function main(): Promise<void> {
       customSecretWords: customWords,
       preferEdgeRelay: Boolean(flags["prefer-edge-relay"]),
       disableEdgeRelay: Boolean(flags["disable-edge-relay"]),
+      disableOptimisticRelay: Boolean(flags["no-optimistic-relay"]),
+      disablePortMapping: Boolean(flags["no-port-mapping"]),
+      disableUdpMtuProbe: Boolean(flags["no-udp-mtu-probe"]),
       maxBandwidthMbps,
       forceTier,
       onPairingCode: (code) => {
@@ -106,6 +122,10 @@ async function main(): Promise<void> {
       targetDir,
       pairingCode: code,
       disableEdgeRelay: Boolean(flags["disable-edge-relay"]),
+      disablePortMapping: Boolean(flags["no-port-mapping"]),
+      onProgress: (ev) => {
+        console.log(`[${ev.phase}] tier=${ev.tier ?? "-"} ${ev.detail ?? ""}`);
+      },
     });
 
     console.log(JSON.stringify(result, null, 2));

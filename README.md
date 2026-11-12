@@ -21,9 +21,23 @@ Run `beamsync-server` (bound to Cloudflare R2) plus optional regional `beamsync-
 - **Small-File & Large-File Engine (`BMSP` Packs + FastCDC)**:
   - Persistent local `(ino, size, mtimeNs, ctimeNs)` stat cache avoids re-hashing unchanged files across tens of thousands of source files.
   - Small files (`<= 256 KiB`) are whole-file BLAKE3-hashed and coalesced into `~8 MiB` `zstd`-compressed, `ChaCha20-Poly1305`-encrypted `BMSP` packs; large files (`> 256 KiB`) are split with Gear-based FastCDC (`64 KiB–1 MiB`) so single-line edits only transmit changed chunks.
+- **Relay First, Upgrade Later**:
+  - Direct-path discovery (same-host IPC, Happy Eyeballs TCP, UDP hole punch) starts in the background as soon as both peers are paired. If no direct path is ready after a `250 ms` grace window and an Edge Relay is eligible, the transfer starts on the relay immediately instead of waiting for NAT traversal.
+  - When a direct path comes up later, the source offers it (`direct_upgrade_offer` / `direct_upgrade_answer`), finishes the pack in flight, and continues on `P2P_DIRECT` from the next pack boundary. No pack is sent twice and nothing touches R2. Disable with `--no-optimistic-relay`.
+- **Resilient Control Plane**:
+  - Every signaling message carries a sequence number (`cseq` client-to-server, `sseq` server-to-client). If the signaling WebSocket drops (Wi-Fi switch, NAT rebind, reverse-proxy restart), the CLI reconnects with exponential backoff for up to `30 s`, resumes with `resumeFromSeq`, and both sides replay only what the other missed, with duplicates discarded.
+  - If the Coordinator stays unreachable past the budget, the transfer fails with `SIGNALING_LOST` instead of hanging. If the other peer disappears and does not resume within `45 s`, the Coordinator tells the survivor `PEER_LOST`.
+  - Long phases (source scan, target hashing of an existing directory, streaming, target commit) have no wall-clock limit; liveness comes from `SIGNALING_LOST` and `PEER_LOST`. The session TTL (`2 h`) slides forward on every signaling message, including the `20 s` keepalive, so multi-hour migrations are not garbage-collected mid-transfer.
+- **Outbound Proxy Support**:
+  - Coordinator REST calls, the signaling WebSocket, presigned R2 `PUT`/`GET`, and Edge Relay `WSS` connections tunnel through an HTTP `CONNECT` proxy (`http://` or `https://`, optional Basic auth) or a SOCKS5 proxy (no-auth or username/password, remote DNS).
+  - Configure with `BEAMSYNC_PROXY`, or the standard `HTTPS_PROXY` / `HTTP_PROXY` / `ALL_PROXY` and `NO_PROXY` (exact host, domain suffix, `host:port`, IPv4 CIDR, `*`). TLS and Edge Relay certificate pinning stay end-to-end inside the tunnel. UDP hole punching does not go through proxies.
+- **UDP Path Tuning**:
+  - After a hole punch succeeds, the sender probes the path with padded datagrams and raises the chunk payload from the conservative `1150` bytes up to `1420` bytes when the path carries it (fewer datagrams per pack). Disable with `--no-udp-mtu-probe`.
+  - A `5 s` UDP keepalive holds the NAT binding open while the transfer is still running on the relay or the source is still scanning.
+  - Behind a symmetric NAT (or when STUN gives no verdict), the CLI asks the local gateway for a UDP port mapping via NAT-PMP and advertises the mapped public endpoint as the first candidate. The mapping is renewed at half its lifetime and deleted when the session ends. Disable with `--no-port-mapping`.
 - **Mid-Flight Fallback, Bandwidth Pacing & Atomic Target Commit**:
   - If a `P2P_DIRECT` or `EDGE_RELAY` connection drops mid-transfer, already-acknowledged packs are retained and only unacknowledged packs seamlessly switch to `R2_PIPELINE`.
-  - Optional `--max-mbps <mbps>` token-bucket pacing prevents background workspace migrations from saturating interactive SSH/IDE sessions.
+  - Optional `--max-mbps <mbps>` token-bucket pacing on every network tier (`P2P_DIRECT`, `EDGE_RELAY`, `STREAM_RELAY`, `R2_PIPELINE`) prevents background workspace migrations from saturating interactive SSH/IDE sessions. Same-host `LOCAL_IPC` never leaves the machine and is not paced.
   - Target workspaces stage into `.beamsync-staging-<sessionId>`, hardlink unchanged local files in `O(1)` disk space, verify `rootTreeDigest`, and commit only after bilateral pack receipts (`sourceReceiptAt` & `targetReceiptAt`) reach equilibrium.
 
 ---
@@ -104,10 +118,40 @@ beamsync receive ./workspace-copy \
   --server https://sync.yourdomain.com \
   --code migrate-devbox-42
 
+# Run behind a corporate egress proxy (HTTP CONNECT or SOCKS5)
+BEAMSYNC_PROXY=http://user:pass@proxy.corp.example:3128 \
+  beamsync send ./workspace --server https://sync.yourdomain.com
+
 # Inspect coordinator health, STUN reflexive address, NAT mapping type (Cone vs Symmetric),
-# prioritized local/overlay/IPv6 interfaces, and RTTs to every regional Edge Relay
+# gateway port mapping, active proxy, prioritized local/overlay/IPv6 interfaces,
+# and RTTs to every regional Edge Relay
 beamsync doctor --server https://sync.yourdomain.com
 ```
+
+| Flag | Side | Effect |
+| :--- | :--- | :--- |
+| `--max-mbps <mbps>` | send | Cap upload bandwidth on network tiers |
+| `--prefer-edge-relay` | send | Use the Edge Relay regardless of transfer size (default cap `512 MiB`) |
+| `--force-tier <tier>` | send | Pin one transport tier |
+| `--no-optimistic-relay` | send | Wait for direct-path probing instead of starting on the Edge Relay |
+| `--no-udp-mtu-probe` | send | Keep `1150`-byte UDP chunks |
+| `--disable-edge-relay` | both | Never use an Edge Relay |
+| `--no-port-mapping` | both | Do not request a NAT-PMP port mapping from the gateway |
+
+| Environment variable | Effect |
+| :--- | :--- |
+| `BEAMSYNC_SERVER_URL` | Default Coordinator URL |
+| `BEAMSYNC_PROXY` | Outbound proxy (`http://`, `https://`, `socks5://`); takes precedence over `HTTPS_PROXY` / `HTTP_PROXY` / `ALL_PROXY` |
+| `BEAMSYNC_NO_PROXY` / `NO_PROXY` | Hosts that bypass the proxy |
+
+### Known Limitations
+
+- Signaling resume covers network drops, not a Coordinator restart: session state lives in Coordinator memory.
+- An Edge Relay data connection that drops is not re-attached; unacknowledged packs fall back to `R2_PIPELINE`.
+- `--max-mbps` paces at pack granularity (wait, then send one pack of up to `~8 MiB`), so traffic is bursty within a pack. Caps below roughly `0.6 Mbps` can exceed the `120 s` inter-pack timeout on direct TCP and Edge Relay paths and trigger the R2 fallback.
+- UDP payload sizing probes a fixed list of sizes (`1420`, `1380`, `1340`, `1300`, `1232`) once after the punch. It is not continuous path-MTU discovery, and hosts that fragment oversized datagrams locally can still pass a probe.
+- Port mapping speaks NAT-PMP only (no UPnP IGD or PCP), maps UDP only, and has been tested against a protocol-level mock gateway, not against physical routers.
+- UDP candidates are IPv4 only. There is no QUIC transport, and the Coordinator, Edge Relay, and STUN listeners do not share a single port.
 
 ---
 

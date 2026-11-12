@@ -32,6 +32,7 @@ import {
   connectEdgeRelayBinaryChannel,
   probeEdgeRelayRtts,
   receivePacksFromEdgeRelay,
+  selectTransportAgent,
   streamPackBatchesOverEdgeRelay,
   type EdgeRelayBinaryChannel,
 } from "./edgeRelayChannel.js";
@@ -46,16 +47,20 @@ import {
   type FramedSocketChannel,
 } from "./framedStream.js";
 import { buildSessionHostFingerprint } from "./hostIdentity.js";
+import { httpRequestBytes } from "./httpClient.js";
 import { AtomicWorkspaceMaterializer } from "./materializer.js";
 import { scanWorkspace, type BlobDiskSlice } from "./stateIndex.js";
 import {
   establishUdpHolePunch,
   finishUdpStream,
   prepareUdpPunchEndpoint,
+  probeUdpPathPayloadSize,
   receivePacksFromUdp,
   sendPackOverUdp,
   type UdpHolePunchChannel,
 } from "./udpHolePunch.js";
+import type { PortMappingGateway } from "./portMapping.js";
+import { resolveProxyForUrl } from "./proxy.js";
 import { zstdCompress, zstdDecompress } from "./zstdCodec.js";
 
 export interface TransferCommonOptions {
@@ -70,7 +75,24 @@ export interface TransferCommonOptions {
   preferEdgeRelay?: boolean;
   edgeRelayMaxBytes?: number;
   maxBandwidthMbps?: number;
+  /**
+   * Disable "relay first, upgrade later": by default, when an Edge Relay is available the
+   * transfer starts on it after a short grace period while direct paths keep probing in the
+   * background, then hot-upgrades to P2P at a pack boundary.
+   */
+  disableOptimisticRelay?: boolean;
+  /** How long to wait for a direct path before starting on the Edge Relay (default 250 ms). */
+  optimisticRelayGraceMs?: number;
+  /** Total time budget for transparently resuming a dropped signaling socket (default 30 s; 0 disables). */
+  signalingReconnectBudgetMs?: number;
+  /** Disable probe-based UDP payload sizing and keep the conservative 1150-byte chunks. */
+  disableUdpMtuProbe?: boolean;
+  /** Do not ask the local gateway for a UDP port mapping (NAT-PMP). */
+  disablePortMapping?: boolean;
+  /** Explicit NAT-PMP gateway; by default the host's default IPv4 gateway is used. */
+  portMappingGateway?: PortMappingGateway;
   allowLoopbackUdpForTest?: boolean;
+  allowLoopbackTcpForTest?: boolean;
   forceTier?: TransportTier;
   targetPackBytes?: number;
   streamRelayThresholdBytes?: number;
@@ -93,6 +115,8 @@ export interface SendDirectoryOptions extends TransferCommonOptions {
   extraIgnoreRules?: string[];
   simulateP2pDropAfterPacks?: number;
   simulateEdgeRelayDropAfterPacks?: number;
+  /** Test hook: delays background direct-path discovery so the Edge Relay starts first. */
+  simulateDirectReadyDelayMs?: number;
   onPairingCode?: (pairingCode: string, sessionId: string) => void;
 }
 
@@ -119,6 +143,14 @@ export interface SendTransferSummary {
   committedFiles: number;
   sourceAllPacksUploadedAtMs: number;
   durationMs: number;
+  /** True when the session started on an Edge Relay and moved to a direct path mid-stream. */
+  upgradedToDirect: boolean;
+  packsViaEdgeRelay: number;
+  packsViaDirect: number;
+  /** Number of times the signaling socket was transparently resumed. */
+  signalingReconnects: number;
+  /** UDP chunk payload size in use (after path probing), when a UDP path was established. */
+  udpChunkPayloadBytes?: number;
 }
 
 export interface ReceiveTransferSummary {
@@ -128,6 +160,8 @@ export interface ReceiveTransferSummary {
   fallbackToR2Triggered: boolean;
   rootTreeDigest: string;
   committedFiles: number;
+  upgradedToDirect: boolean;
+  signalingReconnects: number;
   packsApplied: number;
   firstPackAppliedAtMs: number | null;
   durationMs: number;
@@ -313,63 +347,261 @@ export async function receiveWithManagedLease(params: {
   });
 }
 
+const SIGNALING_KEEPALIVE_MS = 20_000;
+const SIGNALING_ACK_EVERY_MESSAGES = 32;
+const SIGNALING_OUTBOX_ACK_SOLICIT_BYTES = 4 * 1024 * 1024;
+const DEFAULT_SIGNALING_RECONNECT_BUDGET_MS = 30_000;
+/** Matches the Coordinator's pairing TTL: how long a peer waits for the other side to show up. */
+const PEER_JOIN_WAIT_MS = 10 * 60 * 1000;
+
+/**
+ * Reliable, resumable signaling channel to the Coordinator.
+ *
+ * Every control message carries a sequence number in both directions. When the
+ * WebSocket drops (roaming between networks, proxy idle reset, Coordinator LB
+ * recycle) the client reconnects with exponential backoff, re-attaches with
+ * `hello.resumeFromSeq`, replays its un-acknowledged outbox, and the Coordinator
+ * replays everything the client missed. Callers never observe the gap.
+ */
 class SignalingClient {
-  private readonly ws: WebSocket;
+  private ws: WebSocket | null = null;
   private readonly listeners = new Set<(msg: ServerToClientWsMessage) => void>();
   private readonly buffered: ServerToClientWsMessage[] = [];
   private closedError: Error | null = null;
-  private readonly keepaliveTimer: ReturnType<typeof setInterval>;
+  private closedByUser = false;
+  private reconnecting = false;
+  private keepaliveTimer: ReturnType<typeof setInterval> | null = null;
 
-  private constructor(ws: WebSocket) {
-    this.ws = ws;
-    ws.on("message", (raw) => {
-      const str = typeof raw === "string" ? raw : raw.toString("utf8");
-      const parsed = JSON.parse(str) as ServerToClientWsMessage;
-      if (parsed.type === "pong") {
-        return;
-      }
-      if (this.listeners.size === 0) {
-        this.buffered.push(parsed);
-      } else {
-        for (const fn of [...this.listeners]) {
-          fn(parsed);
-        }
-      }
-    });
-    ws.on("close", (_code, reason) => {
-      clearInterval(this.keepaliveTimer);
-      this.closedError = new Error(
-        `Signaling WebSocket closed: ${reason.toString() || "closed"}`,
-      );
-    });
-    ws.on("error", (err) => {
-      clearInterval(this.keepaliveTimer);
-      this.closedError = err;
-    });
+  private helloMsg: Extract<ClientToServerWsMessage, { type: "hello" }> | null = null;
+  private nextClientSeq = 0;
+  private outbox: Array<{ cseq: number; payload: string }> = [];
+  private outboxBytes = 0;
+  private outboxBytesAtLastSolicit = 0;
+  private lastServerSeq = 0;
+  private receivedSinceAck = 0;
+
+  /** Number of successful signaling re-attachments during this session. */
+  reconnectCount = 0;
+  onReconnect: ((reconnectCount: number) => void) | null = null;
+
+  private constructor(
+    private readonly wsUrl: string,
+    private readonly reconnectBudgetMs: number,
+  ) {}
+
+  static async connect(
+    wsUrl: string,
+    opts: { reconnectBudgetMs?: number } = {},
+  ): Promise<SignalingClient> {
+    const client = new SignalingClient(
+      wsUrl,
+      opts.reconnectBudgetMs ?? DEFAULT_SIGNALING_RECONNECT_BUDGET_MS,
+    );
+    const ws = await client.openSocket(15_000);
+    client.attach(ws);
 
     // Periodic 20s keepalive prevents NAT gateways / reverse proxies (60-100s idle timeout)
-    // from dropping the signaling socket during multi-minute bulk transfers.
-    this.keepaliveTimer = setInterval(() => {
-      if (this.ws.readyState === WebSocket.OPEN) {
-        this.send({ type: "ping", ts: Date.now() });
-      }
-    }, 20_000);
-    this.keepaliveTimer.unref();
-  }
-
-  static async connect(wsUrl: string): Promise<SignalingClient> {
-    const ws = new WebSocket(wsUrl);
-    const client = new SignalingClient(ws);
-    await new Promise<void>((resolve, reject) => {
-      ws.once("open", () => resolve());
-      ws.once("error", reject);
-    });
+    // from dropping the signaling socket, and carries cumulative acks in both directions.
+    client.keepaliveTimer = setInterval(() => client.sendAckPing(), SIGNALING_KEEPALIVE_MS);
+    client.keepaliveTimer.unref();
     return client;
   }
 
+  private openSocket(timeoutMs: number): Promise<WebSocket> {
+    return new Promise<WebSocket>((resolve, reject) => {
+      const ws = new WebSocket(this.wsUrl, {
+        agent: selectTransportAgent(this.wsUrl),
+        maxPayload: 256 * 1024 * 1024,
+      });
+      const timer = setTimeout(() => {
+        ws.terminate();
+        reject(new Error("Timed out connecting to signaling WebSocket"));
+      }, timeoutMs);
+      ws.once("open", () => {
+        clearTimeout(timer);
+        ws.removeAllListeners("error");
+        resolve(ws);
+      });
+      ws.once("error", (err) => {
+        clearTimeout(timer);
+        reject(err);
+      });
+    });
+  }
+
+  private attach(ws: WebSocket): void {
+    this.ws = ws;
+    ws.on("message", (raw) => {
+      if (this.ws !== ws) return;
+      const str = typeof raw === "string" ? raw : raw.toString("utf8");
+      let parsed: ServerToClientWsMessage & { sseq?: number };
+      try {
+        parsed = JSON.parse(str) as ServerToClientWsMessage & { sseq?: number };
+      } catch {
+        return;
+      }
+      this.handleIncoming(parsed);
+    });
+    ws.on("close", () => this.handleSocketLost(ws));
+    ws.on("error", () => this.handleSocketLost(ws));
+  }
+
+  private handleIncoming(parsed: ServerToClientWsMessage & { sseq?: number }): void {
+    if (parsed.type === "pong") {
+      if (typeof parsed.ackSeq === "number") this.trimOutbox(parsed.ackSeq);
+      return;
+    }
+    if (parsed.type === "resumed") {
+      this.trimOutbox(parsed.lastClientSeq);
+      for (const entry of this.outbox) {
+        this.rawSend(entry.payload);
+      }
+      return;
+    }
+    if (typeof parsed.sseq === "number") {
+      if (parsed.sseq <= this.lastServerSeq) {
+        return; // duplicate delivered by a replay
+      }
+      this.lastServerSeq = parsed.sseq;
+      this.receivedSinceAck++;
+      if (this.receivedSinceAck >= SIGNALING_ACK_EVERY_MESSAGES) {
+        this.sendAckPing();
+      }
+    }
+    this.dispatch(parsed);
+  }
+
+  private dispatch(msg: ServerToClientWsMessage): void {
+    if (this.listeners.size === 0) {
+      this.buffered.push(msg);
+    } else {
+      for (const fn of [...this.listeners]) {
+        fn(msg);
+      }
+    }
+  }
+
+  private trimOutbox(ackSeq: number): void {
+    let drop = 0;
+    while (drop < this.outbox.length && this.outbox[drop].cseq <= ackSeq) {
+      this.outboxBytes -= this.outbox[drop].payload.length;
+      drop++;
+    }
+    if (drop > 0) this.outbox.splice(0, drop);
+    this.outboxBytesAtLastSolicit = Math.min(this.outboxBytesAtLastSolicit, this.outboxBytes);
+  }
+
+  private rawSend(payload: string): void {
+    const ws = this.ws;
+    if (ws && ws.readyState === WebSocket.OPEN) {
+      try {
+        ws.send(payload);
+      } catch {
+        // The close handler triggers reconnect + replay
+      }
+    }
+  }
+
+  private sendAckPing(): void {
+    this.receivedSinceAck = 0;
+    this.rawSend(
+      JSON.stringify({ type: "ping", ts: Date.now(), ackSeq: this.lastServerSeq }),
+    );
+  }
+
+  private handleSocketLost(ws: WebSocket): void {
+    if (this.ws !== ws) return;
+    this.ws = null;
+    try {
+      ws.terminate();
+    } catch {
+      // already closed
+    }
+    if (this.closedByUser || this.closedError) return;
+    if (!this.helloMsg || this.reconnectBudgetMs <= 0) {
+      this.failPermanently(new Error("Signaling WebSocket closed"));
+      return;
+    }
+    if (!this.reconnecting) {
+      void this.reconnectLoop();
+    }
+  }
+
+  private async reconnectLoop(): Promise<void> {
+    this.reconnecting = true;
+    const deadline = Date.now() + this.reconnectBudgetMs;
+    let backoffMs = 100;
+    let lastErr: Error = new Error("Signaling WebSocket closed");
+
+    try {
+      while (!this.closedByUser && Date.now() < deadline) {
+        try {
+          const ws = await this.openSocket(Math.max(500, Math.min(5000, deadline - Date.now())));
+          if (this.closedByUser) {
+            ws.terminate();
+            return;
+          }
+          this.attach(ws);
+          this.reconnectCount++;
+          // `resumed` answers with the Coordinator's processed watermark; the handler then
+          // replays the outbox, and the Coordinator replays everything after resumeFromSeq.
+          this.rawSend(
+            JSON.stringify({ ...this.helloMsg, resumeFromSeq: this.lastServerSeq }),
+          );
+          this.onReconnect?.(this.reconnectCount);
+          return;
+        } catch (err) {
+          lastErr = err instanceof Error ? err : new Error(String(err));
+          await new Promise((r) => setTimeout(r, backoffMs));
+          backoffMs = Math.min(2000, backoffMs * 2);
+        }
+      }
+      if (!this.closedByUser) {
+        this.failPermanently(
+          new Error(
+            `Signaling connection lost and could not be resumed within ${this.reconnectBudgetMs} ms: ${lastErr.message}`,
+          ),
+        );
+      }
+    } finally {
+      this.reconnecting = false;
+    }
+  }
+
+  private failPermanently(err: Error): void {
+    if (this.closedError) return;
+    this.closedError = err;
+    if (this.keepaliveTimer) clearInterval(this.keepaliveTimer);
+    this.dispatch({
+      type: "session_error",
+      code: "SIGNALING_LOST",
+      message: err.message,
+    });
+  }
+
   send(msg: ClientToServerWsMessage): void {
-    if (this.ws.readyState === WebSocket.OPEN) {
-      this.ws.send(JSON.stringify(msg));
+    if (msg.type === "hello") {
+      this.helloMsg = msg;
+      this.rawSend(JSON.stringify(msg));
+      return;
+    }
+    if (msg.type === "ping") {
+      this.rawSend(JSON.stringify(msg));
+      return;
+    }
+    const cseq = ++this.nextClientSeq;
+    const payload = JSON.stringify({ ...msg, cseq });
+    this.outbox.push({ cseq, payload });
+    this.outboxBytes += payload.length;
+    this.rawSend(payload);
+
+    // Solicit a cumulative ack so the replay outbox stays bounded during bulk relaying
+    if (
+      this.outboxBytes - this.outboxBytesAtLastSolicit >= SIGNALING_OUTBOX_ACK_SOLICIT_BYTES ||
+      this.outbox.length % 64 === 0
+    ) {
+      this.outboxBytesAtLastSolicit = this.outboxBytes;
+      this.sendAckPing();
     }
   }
 
@@ -391,10 +623,15 @@ class SignalingClient {
         reject(this.closedError);
         return;
       }
-      const timer = setTimeout(() => {
-        unsub();
-        reject(new Error(`Timed out waiting for signaling message "${expectedType}"`));
-      }, timeoutMs);
+      // timeoutMs <= 0 waits for as long as the session lives: liveness then comes from
+      // SIGNALING_LOST (own link) and PEER_LOST (other side) rather than a wall-clock guess.
+      const timer =
+        timeoutMs > 0
+          ? setTimeout(() => {
+              unsub();
+              reject(new Error(`Timed out waiting for signaling message "${expectedType}"`));
+            }, timeoutMs)
+          : undefined;
 
       const unsub = this.subscribe((msg) => {
         if (msg.type === "session_error") {
@@ -412,9 +649,48 @@ class SignalingClient {
     });
   }
 
+  /** Test hook: abruptly kills the current socket as if the network path vanished. */
+  simulateNetworkDrop(): void {
+    this.ws?.terminate();
+  }
+
   close(): void {
-    clearInterval(this.keepaliveTimer);
-    this.ws.close();
+    this.closedByUser = true;
+    if (this.keepaliveTimer) clearInterval(this.keepaliveTimer);
+    try {
+      this.ws?.close();
+    } catch {
+      // already closed
+    }
+  }
+}
+
+type DirectPathResult =
+  | { kind: "local_ipc" | "tcp"; sock: FramedSocketChannel }
+  | { kind: "udp"; chan: UdpHolePunchChannel }
+  | null;
+
+function destroyDirectPath(path: DirectPathResult): void {
+  if (!path) return;
+  if (path.kind === "udp") path.chan.destroy();
+  else path.sock.destroy();
+}
+
+/** Resolves with the promise's value if it settles within `ms`, otherwise `{ settled: false }`. */
+async function settleWithin<T>(
+  promise: Promise<T>,
+  ms: number,
+): Promise<{ settled: true; value: T } | { settled: false }> {
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  try {
+    return await Promise.race([
+      promise.then((value) => ({ settled: true as const, value })),
+      new Promise<{ settled: false }>((resolve) => {
+        timer = setTimeout(() => resolve({ settled: false }), ms);
+      }),
+    ]);
+  } finally {
+    if (timer) clearTimeout(timer);
   }
 }
 
@@ -431,11 +707,17 @@ async function runSourceSession(params: {
 }): Promise<SendTransferSummary> {
   const startedAt = Date.now();
   const { options, sessionId, wsUrl, stunServers, edgeRelays } = params;
-  const sig = await SignalingClient.connect(wsUrl);
+  const sig = await SignalingClient.connect(wsUrl, {
+    reconnectBudgetMs: options.signalingReconnectBudgetMs,
+  });
+  sig.onReconnect = (n) =>
+    options.onProgress?.({ phase: "signaling_resumed", detail: `reconnects=${n}` });
   let udpPrep: Awaited<ReturnType<typeof prepareUdpPunchEndpoint>> | null = null;
   let directSock: FramedSocketChannel | null = null;
   let udpChan: UdpHolePunchChannel | null = null;
   let edgeChan: EdgeRelayBinaryChannel | null = null;
+  const directAbort = new AbortController();
+  let directAttemptPromise: Promise<DirectPathResult> | null = null;
   const paceBytes = createBandwidthPacer(options.maxBandwidthMbps);
   const allStunServers = [
     ...stunServers,
@@ -461,7 +743,7 @@ async function runSourceSession(params: {
         ? new PakeHandshake("source", sessionId, params.mode.secretPhrase)
         : null;
 
-    const peerJoinedPromise = sig.waitFor("peer_joined", 120_000);
+    const peerJoinedPromise = sig.waitFor("peer_joined", PEER_JOIN_WAIT_MS);
     sig.send({
       type: "hello",
       role: "source",
@@ -514,12 +796,21 @@ async function runSourceSession(params: {
       udpPrep = await prepareUdpPunchEndpoint(
         allStunServers,
         Boolean(options.allowLoopbackUdpForTest),
+        { disabled: options.disablePortMapping, gateway: options.portMappingGateway },
       );
+      if (udpPrep.portMapping) {
+        options.onProgress?.({
+          phase: "port_mapped",
+          detail: `udp ${udpPrep.portMapping.externalIp}:${udpPrep.portMapping.externalPort} via ${udpPrep.portMapping.gateway.address}`,
+        });
+      }
     }
 
     const relayRttMs = await relayRttPromise;
     const peerConfirmedPromise = sig.waitFor("peer_confirmed", 20_000);
-    const targetBlobsPromise = sig.waitFor("target_have_blobs", 60_000);
+    // Unbounded: the target may be hashing an existing multi-GB directory before it answers
+    const targetBlobsPromise = sig.waitFor("target_have_blobs", 0);
+    targetBlobsPromise.catch(() => {});
 
     sig.send({
       type: "pake_confirm",
@@ -538,6 +829,76 @@ async function runSourceSession(params: {
       )
     ) {
       throw new Error("PAKE_AUTH_FAILED: Pairing phrase mismatch");
+    }
+
+    // Direct-path discovery starts the moment both peers are authenticated and runs in the
+    // background, concurrently with the workspace scan and (later) with Edge Relay streaming:
+    // same-host IPC -> Happy Eyeballs TCP -> UDP hole punch.
+    const relayMayCarryStart =
+      !options.disableEdgeRelay &&
+      !options.disableOptimisticRelay &&
+      Boolean(peerConfirmed.selectedEdgeRelay);
+    if (!options.forceTier) {
+      const localUdpPrep = udpPrep;
+      directAttemptPromise = (async (): Promise<DirectPathResult> => {
+        try {
+          if (options.simulateDirectReadyDelayMs) {
+            await new Promise((r) => setTimeout(r, options.simulateDirectReadyDelayMs));
+          }
+          if (directAbort.signal.aborted) return null;
+
+          if (peerConfirmed.sameHostMatch && !options.disableLocalIpc) {
+            const sock = await tryConnectCandidates(
+              peerConfirmed.peerCandidates.filter(
+                (c) => c.kind === "unix_socket" || c.kind === "loopback_tcp",
+              ),
+              keys.transportKey,
+              sessionId,
+            );
+            if (sock) return { kind: "local_ipc", sock };
+          }
+          if (options.disableP2p || directAbort.signal.aborted) return null;
+
+          if (!options.disableP2pTcp) {
+            const sock = await tryConnectCandidates(
+              peerConfirmed.peerCandidates.filter((c) => c.kind === "lan_tcp"),
+              keys.transportKey,
+              sessionId,
+            );
+            if (sock) return { kind: "tcp", sock };
+          }
+
+          // Skip a futile punch when BOTH peers are behind unpredicted Symmetric NAT.
+          const bothUnpredictedSymmetricNat =
+            localUdpPrep?.natMapping === "symmetric" &&
+            !localUdpPrep.hasSequentialPrediction &&
+            peerConfirmed.peerNatMapping === "symmetric";
+          if (
+            localUdpPrep &&
+            !bothUnpredictedSymmetricNat &&
+            !directAbort.signal.aborted &&
+            peerConfirmed.peerCandidates.some((c) => c.kind === "udp_punch")
+          ) {
+            const chan = await establishUdpHolePunch({
+              socket: localUdpPrep.socket,
+              transportKey: keys.transportKey,
+              sessionId,
+              peerUdpCandidates: peerConfirmed.peerCandidates,
+              // With a relay carrying the first packs the punch can keep trying far longer
+              // without delaying the transfer, which rescues slow or lossy NAT traversal.
+              timeoutMs: relayMayCarryStart ? 12_000 : 1500,
+              signal: directAbort.signal,
+            });
+            if (!options.disableUdpMtuProbe) {
+              await probeUdpPathPayloadSize(chan).catch(() => {});
+            }
+            return { kind: "udp", chan };
+          }
+        } catch {
+          // No direct path; relay / R2 tiers take over
+        }
+        return null;
+      })();
     }
 
     const [sourceScan, targetHaveMsg] = await Promise.all([
@@ -565,6 +926,10 @@ async function runSourceSession(params: {
     // Negotiate transport tier
     let selectedTier: TransportTier = "R2_PIPELINE";
     let selectedEdgeRelayRegion: string | undefined;
+    let pendingDirectUpgrade: Promise<DirectPathResult> | null = null;
+    let upgradedToDirect = false;
+    let packsViaEdgeRelay = 0;
+    let packsViaDirect = 0;
     const relayThreshold =
       options.streamRelayThresholdBytes ?? DEFAULT_STREAM_RELAY_THRESHOLD_BYTES;
     const edgeRelayMaxBytes =
@@ -601,6 +966,9 @@ async function runSourceSession(params: {
             peerUdpCandidates: peerConfirmed.peerCandidates,
             timeoutMs: 2000,
           });
+          if (!options.disableUdpMtuProbe) {
+            await probeUdpPathPayloadSize(udpChan).catch(() => {});
+          }
         }
         if (!directSock && !udpChan) {
           throw new Error("Forced P2P_DIRECT tier failed to establish");
@@ -612,77 +980,42 @@ async function runSourceSession(params: {
         selectedEdgeRelayRegion = peerConfirmed.selectedEdgeRelay.region;
       }
     } else {
-      // Automatic 5-Tier Happy Eyeballs Negotiation:
-      // 1. Same-host LOCAL_IPC
-      if (peerConfirmed.sameHostMatch && !options.disableLocalIpc) {
-        directSock = await tryConnectCandidates(
-          peerConfirmed.peerCandidates.filter(
-            (c) => c.kind === "unix_socket" || c.kind === "loopback_tcp",
-          ),
-          keys.transportKey,
-          sessionId,
-        );
-        if (directSock) {
-          selectedTier = "LOCAL_IPC";
-        }
-      }
-
-      // 2. P2P_DIRECT (LAN TCP -> STUN UDP Hole Punch)
-      if (!directSock && !options.disableP2p) {
-        if (!options.disableP2pTcp) {
-          directSock = await tryConnectCandidates(
-            peerConfirmed.peerCandidates.filter((c) => c.kind === "lan_tcp"),
-            keys.transportKey,
-            sessionId,
-          );
-          if (directSock) {
-            selectedTier = "P2P_DIRECT";
-          }
-        }
-        // Skip futile 1.5s UDP hole-punch delay when BOTH peers are behind unpredicted
-        // Symmetric NAT and an Edge Relay or R2 fallback is available.
-        const bothUnpredictedSymmetricNat =
-          udpPrep?.natMapping === "symmetric" &&
-          !udpPrep.hasSequentialPrediction &&
-          peerConfirmed.peerNatMapping === "symmetric";
-
-        if (
-          !directSock &&
-          udpPrep &&
-          !bothUnpredictedSymmetricNat &&
-          peerConfirmed.peerCandidates.some((c) => c.kind === "udp_punch")
-        ) {
-          try {
-            udpChan = await establishUdpHolePunch({
-              socket: udpPrep.socket,
-              transportKey: keys.transportKey,
-              sessionId,
-              peerUdpCandidates: peerConfirmed.peerCandidates,
-              timeoutMs: 1500,
-            });
-            selectedTier = "P2P_DIRECT";
-          } catch {
-            udpChan = null;
-          }
-        }
-      }
-
-      // 3. EDGE_RELAY (multi-region binary cut-through WSS / IP+TLS)
-      //    vs 4. Micro-delta STREAM_RELAY vs 5. Bulk CAS R2_PIPELINE
-      if (!directSock && !udpChan) {
-        if (
-          !options.disableEdgeRelay &&
+      // Automatic negotiation. Direct attempts have been racing in the background since
+      // `peer_confirmed`, so on LAN / same-host they are normally settled by now.
+      const relayEligible = Boolean(
+        !options.disableEdgeRelay &&
           peerConfirmed.selectedEdgeRelay &&
-          (options.preferEdgeRelay || missingBytesEstimate <= edgeRelayMaxBytes)
-        ) {
-          selectedTier = "EDGE_RELAY";
-          selectedEdgeRelayRegion = peerConfirmed.selectedEdgeRelay.region;
+          (options.preferEdgeRelay || missingBytesEstimate <= edgeRelayMaxBytes),
+      );
+      const optimisticRelay = relayEligible && !options.disableOptimisticRelay;
+      const direct = await settleWithin(
+        directAttemptPromise ?? Promise.resolve(null),
+        optimisticRelay ? (options.optimisticRelayGraceMs ?? 250) : 2600,
+      );
+
+      if (direct.settled && direct.value) {
+        // 1. Same-host LOCAL_IPC / 2. P2P_DIRECT (TCP or punched UDP)
+        if (direct.value.kind === "udp") {
+          udpChan = direct.value.chan;
+          selectedTier = "P2P_DIRECT";
         } else {
-          selectedTier =
-            missingBytesEstimate <= relayThreshold
-              ? "STREAM_RELAY"
-              : "R2_PIPELINE";
+          directSock = direct.value.sock;
+          selectedTier = direct.value.kind === "local_ipc" ? "LOCAL_IPC" : "P2P_DIRECT";
         }
+      } else if (relayEligible) {
+        // 3. EDGE_RELAY now; keep probing and hot-upgrade to P2P at a pack boundary
+        selectedTier = "EDGE_RELAY";
+        selectedEdgeRelayRegion = peerConfirmed.selectedEdgeRelay!.region;
+        if (!direct.settled && optimisticRelay) {
+          pendingDirectUpgrade = directAttemptPromise;
+        } else {
+          directAbort.abort();
+        }
+      } else {
+        // 4. Micro-delta STREAM_RELAY vs 5. Bulk CAS R2_PIPELINE
+        directAbort.abort();
+        selectedTier =
+          missingBytesEstimate <= relayThreshold ? "STREAM_RELAY" : "R2_PIPELINE";
       }
     }
 
@@ -692,7 +1025,11 @@ async function runSourceSession(params: {
       detail: `missing=${missingHashes.length} blobs (${missingBytesEstimate} B)${selectedEdgeRelayRegion ? ` relay=${selectedEdgeRelayRegion}` : ""}`,
     });
 
-    const committedPromise = sig.waitFor("session_committed", 120_000);
+    // Unbounded: streaming plus target materialization of a multi-GB workspace takes as long
+    // as it takes. The no-op catch keeps an early session error from surfacing as an unhandled
+    // rejection while packs are still being sent; it is rethrown when awaited below.
+    const committedPromise = sig.waitFor("session_committed", 0);
+    committedPromise.catch(() => {});
 
     sig.send({
       type: "source_transfer_plan",
@@ -702,6 +1039,9 @@ async function runSourceSession(params: {
       missingBytesEstimate,
       selectedTier,
       selectedEdgeRelayRegion,
+      directUpgradePending: pendingDirectUpgrade ? true : undefined,
+      directChannel:
+        selectedTier === "P2P_DIRECT" ? (udpChan ? "udp" : "tcp") : undefined,
     });
 
     const targetPackBytes = options.targetPackBytes ?? DEFAULT_TARGET_PACK_BYTES;
@@ -760,6 +1100,7 @@ async function runSourceSession(params: {
           }
           requiredPackIds.push(pack.packId);
           ackedOnDirect.push(pack.packId);
+          packsViaDirect++;
           wireBytesSent += pack.wireBytes.length;
         } catch {
           failedBatchStartIndex = i;
@@ -804,6 +1145,43 @@ async function runSourceSession(params: {
       let ackedPackIds: string[] = [];
       let unackedBatches: string[][] = [];
 
+      // Hot upgrade: once the background direct attempt succeeds, offer it to the target.
+      // Only after the target confirms it holds the same channel does the relay stream
+      // hand off at the next pack boundary.
+      let confirmedUpgrade: DirectPathResult = null;
+      let relayPhaseOver = false;
+      let signalRelayPhaseOver: () => void = () => {};
+      const relayPhaseOverPromise = new Promise<void>((r) => {
+        signalRelayPhaseOver = r;
+      });
+      const upgradeTask: Promise<void> = pendingDirectUpgrade
+        ? pendingDirectUpgrade
+            .then(async (res) => {
+              if (!res) return;
+              if (relayPhaseOver) {
+                destroyDirectPath(res);
+                return;
+              }
+              const answerPromise = sig
+                .waitFor("direct_upgrade_answer", 5000)
+                .catch(() => null);
+              sig.send({
+                type: "direct_upgrade_offer",
+                channel: res.kind === "udp" ? "udp" : "tcp",
+              });
+              const answer = await Promise.race([
+                answerPromise,
+                relayPhaseOverPromise.then(() => null),
+              ]);
+              if (answer?.accepted) {
+                confirmedUpgrade = res;
+              } else {
+                destroyDirectPath(res);
+              }
+            })
+            .catch(() => {})
+        : Promise.resolve();
+
       try {
         edgeChan = await connectEdgeRelayBinaryChannel({
           wsRelayUrl: alloc.wsRelayUrl,
@@ -819,6 +1197,7 @@ async function runSourceSession(params: {
           totalBatches: batches.length,
           simulateDropAfterPacks: options.simulateEdgeRelayDropAfterPacks,
           paceBytes,
+          shouldHandOff: () => confirmedUpgrade !== null,
           producePackAt: async (idx) => {
             const blobs = await readBlobBatch(batches[idx], sourceScan.blobSlices);
             return encodePack(blobs, {
@@ -832,7 +1211,8 @@ async function runSourceSession(params: {
 
         wireBytesSent += streamRes.wireBytesSent;
         ackedPackIds = streamRes.ackedPackIds;
-        if (!streamRes.interrupted) {
+        packsViaEdgeRelay = ackedPackIds.length;
+        if (!streamRes.interrupted && !streamRes.handedOff) {
           for (const pid of streamRes.allPackIds) {
             if (pid) requiredPackIds.push(pid);
           }
@@ -853,6 +1233,68 @@ async function runSourceSession(params: {
         unackedBatches = batches;
       }
 
+      relayPhaseOver = true;
+      signalRelayPhaseOver();
+      if (!confirmedUpgrade) {
+        // Nothing left for a late direct path to carry; stop probing instead of waiting for it
+        directAbort.abort();
+      }
+      await settleWithin(upgradeTask, 150);
+      const upgradePath = confirmedUpgrade as DirectPathResult;
+
+      if (upgradePath) {
+        // The target is already reading this channel. Move every not-yet-acknowledged batch
+        // onto it; if the relay happened to finish everything, just end the stream cleanly.
+        if (upgradePath.kind === "udp") udpChan = upgradePath.chan;
+        else directSock = upgradePath.sock;
+
+        if (unackedBatches.length > 0) {
+          upgradedToDirect = true;
+          selectedTier = "P2P_DIRECT";
+          options.onProgress?.({
+            phase: "upgraded_to_direct",
+            tier: "P2P_DIRECT",
+            detail: `channel=${upgradePath.kind} remainingPacks=${unackedBatches.length}`,
+          });
+        }
+        let failedAt = -1;
+        for (let i = 0; i < unackedBatches.length; i++) {
+          try {
+            const blobs = await readBlobBatch(unackedBatches[i], sourceScan.blobSlices);
+            const pack = await encodePack(blobs, {
+              compression: "zstd",
+              encryption: "chacha20-poly1305",
+              packKey: keys.packKey,
+              zstdCompressFn: zstdCompress,
+            });
+            await paceBytes?.(pack.wireBytes.length);
+            if (upgradePath.kind === "udp") {
+              await sendPackOverUdp(upgradePath.chan, i, pack.packId, pack.wireBytes);
+            } else {
+              await sendPackOverSocket(upgradePath.sock, pack.packId, pack.wireBytes);
+            }
+            requiredPackIds.push(pack.packId);
+            ackedPackIds.push(pack.packId);
+            packsViaDirect++;
+            wireBytesSent += pack.wireBytes.length;
+          } catch {
+            failedAt = i;
+            break;
+          }
+        }
+        if (failedAt === -1) {
+          try {
+            if (upgradePath.kind === "udp") await finishUdpStream(upgradePath.chan);
+            else await finishSocketStream(upgradePath.sock);
+          } catch {
+            // Every pack is already acknowledged; a failed FIN is harmless
+          }
+          unackedBatches = [];
+        } else {
+          unackedBatches = unackedBatches.slice(failedAt);
+        }
+      }
+
       if (unackedBatches.length > 0) {
         fallbackToR2Triggered = true;
         selectedTier = "R2_PIPELINE";
@@ -862,7 +1304,9 @@ async function runSourceSession(params: {
         );
         sig.send({
           type: "fallback_to_r2",
-          reason: "Edge Relay stream interrupted; switching remaining packs to R2_PIPELINE",
+          reason: upgradePath
+            ? "Direct path dropped after hot upgrade; switching remaining packs to R2_PIPELINE"
+            : "Edge Relay stream interrupted; switching remaining packs to R2_PIPELINE",
           targetReceivedPackIds: ackedPackIds,
         });
         await fallbackActivatedPromise;
@@ -956,8 +1400,16 @@ async function runSourceSession(params: {
       committedFiles: committed.committedFiles,
       sourceAllPacksUploadedAtMs,
       durationMs: Date.now() - startedAt,
+      upgradedToDirect,
+      packsViaEdgeRelay,
+      packsViaDirect,
+      signalingReconnects: sig.reconnectCount,
+      udpChunkPayloadBytes: udpChan?.chunkPayloadBytes,
     };
   } finally {
+    directAbort.abort();
+    // Release a direct path that finished connecting but was never adopted
+    void directAttemptPromise?.then(destroyDirectPath, () => {});
     edgeChan?.destroy();
     directSock?.destroy();
     udpChan?.destroy();
@@ -979,7 +1431,13 @@ async function runTargetSession(params: {
 }): Promise<ReceiveTransferSummary> {
   const startedAt = Date.now();
   const { options, sessionId, wsUrl, stunServers, edgeRelays } = params;
-  const sig = await SignalingClient.connect(wsUrl);
+  const sig = await SignalingClient.connect(wsUrl, {
+    reconnectBudgetMs: options.signalingReconnectBudgetMs,
+  });
+  sig.onReconnect = (n) =>
+    options.onProgress?.({ phase: "signaling_resumed", detail: `reconnects=${n}` });
+  const punchAbort = new AbortController();
+  let upgradedToDirect = false;
   let directListeners: Awaited<
     ReturnType<typeof createTargetDirectListeners>
   > | null = null;
@@ -1010,7 +1468,7 @@ async function runTargetSession(params: {
         ? new PakeHandshake("target", sessionId, params.mode.secretPhrase)
         : null;
 
-    const peerJoinedPromise = sig.waitFor("peer_joined", 120_000);
+    const peerJoinedPromise = sig.waitFor("peer_joined", PEER_JOIN_WAIT_MS);
     sig.send({
       type: "hello",
       role: "target",
@@ -1069,6 +1527,7 @@ async function runTargetSession(params: {
       transportKey: keys.transportKey,
       enableLocalIpc,
       enableLanTcp,
+      includeLoopbackTcpForTest: options.allowLoopbackTcpForTest,
       rejectedAttemptCounter: options.rejectedDirectAttemptCounter,
     });
 
@@ -1076,7 +1535,14 @@ async function runTargetSession(params: {
       udpPrep = await prepareUdpPunchEndpoint(
         allStunServers,
         Boolean(options.allowLoopbackUdpForTest),
+        { disabled: options.disablePortMapping, gateway: options.portMappingGateway },
       );
+      if (udpPrep.portMapping) {
+        options.onProgress?.({
+          phase: "port_mapped",
+          detail: `udp ${udpPrep.portMapping.externalIp}:${udpPrep.portMapping.externalPort} via ${udpPrep.portMapping.gateway.address}`,
+        });
+      }
     }
 
     const relayRttMs = await relayRttPromise;
@@ -1114,7 +1580,10 @@ async function runTargetSession(params: {
         transportKey: keys.transportKey,
         sessionId,
         peerUdpCandidates: peerConfirmed.peerCandidates,
-        timeoutMs: 3500,
+        // Long-lived background punch: the source may still be scanning a large workspace,
+        // or may already be streaming over an Edge Relay while NAT traversal keeps trying.
+        timeoutMs: 20_000,
+        signal: punchAbort.signal,
       }).catch(() => null);
     }
 
@@ -1186,7 +1655,9 @@ async function runTargetSession(params: {
       }
     });
 
-    const planPromise = sig.waitFor("source_transfer_plan", 60_000);
+    // Unbounded: the source may still be scanning tens of thousands of files
+    const planPromise = sig.waitFor("source_transfer_plan", 0);
+    planPromise.catch(() => {});
     sig.send({
       type: "target_have_blobs",
       knownBlobHashes: Array.from(existingBlobs.keys()),
@@ -1279,9 +1750,19 @@ async function runTargetSession(params: {
       if (sessionFatalError) throw sessionFatalError;
     } else if (selectedTier === "P2P_DIRECT") {
       try {
-        const punched = pendingUdpPunchPromise
-          ? await pendingUdpPunchPromise
-          : null;
+        // The source states which direct channel it writes to, so a target that holds both
+        // an accepted TCP socket and a punched UDP channel never reads the wrong one.
+        let punched: UdpHolePunchChannel | null = null;
+        if (plan.directChannel !== "tcp" && pendingUdpPunchPromise) {
+          const res = await settleWithin(
+            pendingUdpPunchPromise,
+            plan.directChannel === "udp" ? 6000 : 3500,
+          );
+          punched = res.settled ? res.value : null;
+          if (plan.directChannel === "udp" && !punched) {
+            throw new Error("Source selected UDP but the target punch did not complete");
+          }
+        }
         if (punched) {
           udpChan = punched;
           await Promise.race([
@@ -1321,7 +1802,52 @@ async function runTargetSession(params: {
         if (sessionFatalError) throw sessionFatalError;
       }
     } else if (selectedTier === "EDGE_RELAY") {
-      try {
+      // Packs may arrive over the Edge Relay and, after a hot upgrade, over a direct channel.
+      // Both readers run concurrently; `applyPackWireBytes` is idempotent per pack id and the
+      // Coordinator's bilateral receipts decide when the transfer is complete.
+      let relayFailure: Error | null = null;
+      let directReaderActive = false;
+      let directFailedAtMs: number | null = null;
+      let directUpgradeChannel: FramedSocketChannel | null = null;
+
+      const unsubUpgrade = sig.subscribe((msg) => {
+        if (msg.type !== "direct_upgrade_offer" || directReaderActive) return;
+        const offered = msg.channel;
+        void (async () => {
+          try {
+            let reader: Promise<void>;
+            if (offered === "udp") {
+              const res = pendingUdpPunchPromise
+                ? await settleWithin(pendingUdpPunchPromise, 4000)
+                : null;
+              const punched = res && res.settled ? res.value : null;
+              if (!punched) throw new Error("UDP punch not established on target");
+              udpChan = punched;
+              reader = receivePacksFromUdp(punched, applyPackWireBytes);
+            } else {
+              const { channel } = await directListeners!.waitForAuthenticatedChannel(4000);
+              directUpgradeChannel = channel;
+              reader = receivePacksFromSocket(channel, applyPackWireBytes);
+            }
+            // Reader is attached before the answer leaves, so no direct pack can be missed
+            directReaderActive = true;
+            upgradedToDirect = true;
+            reader.catch(() => {
+              directFailedAtMs = Date.now();
+            });
+            sig.send({ type: "direct_upgrade_answer", channel: offered, accepted: true });
+            options.onProgress?.({
+              phase: "upgraded_to_direct",
+              tier: "P2P_DIRECT",
+              detail: `channel=${offered}`,
+            });
+          } catch {
+            sig.send({ type: "direct_upgrade_answer", channel: offered, accepted: false });
+          }
+        })();
+      });
+
+      const relayTask = (async () => {
         const alloc = peerConfirmed.selectedEdgeRelay;
         if (!alloc) {
           throw new Error("Missing selectedEdgeRelay allocation on target");
@@ -1334,38 +1860,55 @@ async function runTargetSession(params: {
           certSha256: alloc.certSha256,
           noSni: alloc.noSni,
         });
-        await Promise.race([
-          receivePacksFromEdgeRelay(edgeChan, applyPackWireBytes),
-          waitForFallbackTrigger(() => fallbackToR2Triggered, (fn) => {
-            notifyFallback = fn;
-          }),
-        ]);
+        await receivePacksFromEdgeRelay(edgeChan, applyPackWireBytes);
         edgeChan.destroy();
-      } catch (err) {
-        if (
-          options.forceTier === "EDGE_RELAY" &&
-          err instanceof Error &&
-          err.message.includes("EDGE_RELAY_CERT_PIN_MISMATCH")
-        ) {
-          throw err;
-        }
-        if (!fallbackToR2Triggered) {
-          sig.send({
-            type: "fallback_to_r2",
-            reason: "Target Edge Relay reader interrupted",
-            targetReceivedPackIds: Array.from(appliedPackIds),
-          });
-          fallbackToR2Triggered = true;
-        }
+      })().catch((err) => {
+        relayFailure = err instanceof Error ? err : new Error(String(err));
+      });
+
+      // A source-side failure is announced via `fallback_to_r2_activated` immediately. The
+      // target-initiated fallback below is only a backstop, so a direct reader that ends
+      // abruptly gets a short grace period for the commit grant to arrive first.
+      const DIRECT_FAILURE_GRACE_MS = 2000;
+      await waitUntil(
+        () =>
+          grantCommitReceived ||
+          Boolean(sessionFatalError) ||
+          fallbackToR2Triggered ||
+          (relayFailure !== null && !directReaderActive) ||
+          (directFailedAtMs !== null &&
+            Date.now() - directFailedAtMs >= DIRECT_FAILURE_GRACE_MS),
+      );
+      unsubUpgrade();
+      void relayTask;
+      if (sessionFatalError) throw sessionFatalError;
+
+      const relayErr = relayFailure as Error | null;
+      if (
+        relayErr &&
+        options.forceTier === "EDGE_RELAY" &&
+        relayErr.message.includes("EDGE_RELAY_CERT_PIN_MISMATCH")
+      ) {
+        throw relayErr;
       }
 
+      if (!grantCommitReceived && !fallbackToR2Triggered) {
+        sig.send({
+          type: "fallback_to_r2",
+          reason: directReaderActive
+            ? "Target direct reader interrupted after hot upgrade"
+            : "Target Edge Relay reader interrupted",
+          targetReceivedPackIds: Array.from(appliedPackIds),
+        });
+        fallbackToR2Triggered = true;
+      }
       if (fallbackToR2Triggered) {
         selectedTier = "R2_PIPELINE";
         await runR2ConcurrentDownloadUntilGrant();
-      } else {
-        await waitUntil(() => grantCommitReceived || Boolean(sessionFatalError));
-        if (sessionFatalError) throw sessionFatalError;
+      } else if (upgradedToDirect) {
+        selectedTier = "P2P_DIRECT";
       }
+      (directUpgradeChannel as FramedSocketChannel | null)?.destroy();
     } else if (selectedTier === "STREAM_RELAY") {
       while (!grantCommitReceived) {
         if (sessionFatalError) throw sessionFatalError;
@@ -1400,6 +1943,8 @@ async function runTargetSession(params: {
       fallbackToR2Triggered,
       rootTreeDigest: plan.rootTreeDigest,
       committedFiles,
+      upgradedToDirect,
+      signalingReconnects: sig.reconnectCount,
       packsApplied: appliedPackIds.size,
       firstPackAppliedAtMs,
       durationMs: Date.now() - startedAt,
@@ -1408,6 +1953,7 @@ async function runTargetSession(params: {
     await materializer?.abort();
     throw err;
   } finally {
+    punchAbort.abort();
     edgeChan?.destroy();
     udpChan?.destroy();
     await udpPrep?.close();
@@ -1590,22 +2136,15 @@ async function tryConnectCandidates(
 async function putBytesWithRetry(
   url: string,
   bytes: Uint8Array,
-  maxAttempts = 3,
+  maxAttempts = 4,
 ): Promise<void> {
   let lastErr: unknown;
   for (let attempt = 1; attempt <= maxAttempts; attempt++) {
     try {
-      const res = await fetch(url, {
-        method: "PUT",
-        headers: {
-          "content-length": String(bytes.byteLength),
-        },
-        body: Buffer.from(bytes.buffer, bytes.byteOffset, bytes.byteLength),
-      });
-      if (!res.ok) {
+      const res = await httpRequestBytes("PUT", url, { body: bytes });
+      if (res.status < 200 || res.status >= 300) {
         throw new Error(`PUT pack failed with HTTP ${res.status}`);
       }
-      await res.arrayBuffer();
       return;
     } catch (err) {
       lastErr = err;
@@ -1619,17 +2158,16 @@ async function putBytesWithRetry(
 
 async function fetchBytesWithRetry(
   url: string,
-  maxAttempts = 3,
+  maxAttempts = 4,
 ): Promise<Uint8Array> {
   let lastErr: unknown;
   for (let attempt = 1; attempt <= maxAttempts; attempt++) {
     try {
-      const res = await fetch(url, { method: "GET" });
-      if (!res.ok) {
+      const res = await httpRequestBytes("GET", url);
+      if (res.status < 200 || res.status >= 300) {
         throw new Error(`GET pack failed with HTTP ${res.status}`);
       }
-      const ab = await res.arrayBuffer();
-      return new Uint8Array(ab);
+      return new Uint8Array(res.body.buffer, res.body.byteOffset, res.body.byteLength);
     } catch (err) {
       lastErr = err;
       if (attempt < maxAttempts) {
@@ -1651,13 +2189,12 @@ async function httpPostJson<T>(
   if (bearerToken) {
     headers.authorization = `Bearer ${bearerToken}`;
   }
-  const res = await fetch(url, {
-    method: "POST",
+  const res = await httpRequestBytes("POST", url, {
     headers,
-    body: JSON.stringify(body),
+    body: Buffer.from(JSON.stringify(body), "utf8"),
   });
-  const text = await res.text();
-  if (!res.ok) {
+  const text = res.body.toString("utf8");
+  if (res.status < 200 || res.status >= 300) {
     throw new Error(`HTTP ${res.status} from ${url}: ${text}`);
   }
   return JSON.parse(text) as T;
@@ -1690,16 +2227,21 @@ export async function runDoctor(serverUrl: string): Promise<{
   stunReflexiveEndpoint: { ip: string; port: number } | null;
   natMapping: NatMappingBehavior;
   natPortStride: number;
+  gatewayPortMapping: { protocol: string; gateway: string; externalEndpoint: string } | null;
+  proxy: string | null;
   directInterfaces: DiscoveredDirectAddress[];
   edgeRelayRttMs: Record<string, number>;
   zstdSelfTestOk: boolean;
 }> {
   const baseHttp = serverUrl.replace(/\/+$/, "");
-  const healthRes = await fetch(`${baseHttp}/healthz`);
-  if (!healthRes.ok) {
+  const healthRes = await httpRequestBytes("GET", `${baseHttp}/healthz`);
+  if (healthRes.status < 200 || healthRes.status >= 300) {
     throw new Error(`Server health check failed with HTTP ${healthRes.status}`);
   }
-  const serverHealth = (await healthRes.json()) as Record<string, unknown>;
+  const serverHealth = JSON.parse(healthRes.body.toString("utf8")) as Record<
+    string,
+    unknown
+  >;
   const stunServers = Array.isArray(serverHealth.stunServers)
     ? (serverHealth.stunServers as string[])
     : ["stun:stun.cloudflare.com:3478"];
@@ -1717,7 +2259,18 @@ export async function runDoctor(serverUrl: string): Promise<{
     prepareUdpPunchEndpoint(allStunServers),
     probeEdgeRelayRtts(edgeRelays, 1500),
   ]);
-  const udpCand = prep.candidates.find((c) => c.kind === "udp_punch");
+  const gatewayPortMapping = prep.portMapping
+    ? {
+        protocol: "nat-pmp",
+        gateway: prep.portMapping.gateway.address,
+        externalEndpoint: `${prep.portMapping.externalIp}:${prep.portMapping.externalPort}`,
+      }
+    : null;
+  const udpCand = prep.candidates.find(
+    (c) =>
+      c.kind === "udp_punch" &&
+      !(prep.portMapping && c.port === prep.portMapping.externalPort && c.address === prep.portMapping.externalIp),
+  );
   await prep.close();
 
   const sample = new TextEncoder().encode("beamsync-doctor-zstd-check".repeat(32));
@@ -1733,6 +2286,8 @@ export async function runDoctor(serverUrl: string): Promise<{
       : null,
     natMapping: prep.natMapping,
     natPortStride: prep.portStride,
+    gatewayPortMapping,
+    proxy: resolveProxyForUrl(baseHttp)?.display ?? null,
     directInterfaces: discoverDirectIpAddresses(),
     edgeRelayRttMs,
     zstdSelfTestOk,

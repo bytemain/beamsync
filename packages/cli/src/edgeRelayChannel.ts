@@ -1,4 +1,3 @@
-import crypto from "node:crypto";
 import http from "node:http";
 import https from "node:https";
 import tls from "node:tls";
@@ -11,6 +10,11 @@ import {
   utf8Bytes,
   type EdgeRelayNodeInfo,
 } from "@beamsync/protocol";
+import {
+  attachCertPinCheck,
+  createProxyTunnelAgent,
+  resolveProxyForUrl,
+} from "./proxy.js";
 
 const RELAY_PAIRED_SIGNAL_BYTE = 0x01;
 const FRAME_AUTH_INIT = 0x01;
@@ -55,31 +59,7 @@ export function createEdgeRelayHttpsAgent(params: {
       const sock = origCreateConnection(tlsOpts);
       if (expectedPin) {
         // Prepend listener so pin verification executes before any buffered HTTP/WS write flushes
-        sock.prependOnceListener("secureConnect", () => {
-          const peerCert = sock.getPeerCertificate(false);
-          if (!peerCert || !peerCert.raw || peerCert.raw.length === 0) {
-            sock.destroy(
-              new Error("EDGE_RELAY_CERT_PIN_MISMATCH: missing peer certificate"),
-            );
-            return;
-          }
-          const actualSha256 = crypto
-            .createHash("sha256")
-            .update(peerCert.raw)
-            .digest("hex")
-            .toLowerCase();
-
-          if (
-            expectedPin.length !== actualSha256.length ||
-            !constantTimeEqual(utf8Bytes(actualSha256), utf8Bytes(expectedPin))
-          ) {
-            sock.destroy(
-              new Error(
-                `EDGE_RELAY_CERT_PIN_MISMATCH: expected ${expectedPin}, got ${actualSha256}`,
-              ),
-            );
-          }
-        });
+        attachCertPinCheck(sock, expectedPin);
       }
 
       return sock;
@@ -88,18 +68,42 @@ export function createEdgeRelayHttpsAgent(params: {
   return agent;
 }
 
+/**
+ * Picks the outbound agent for an HTTP(S)/WS(S) URL: a proxy tunnel when
+ * `HTTPS_PROXY` / `HTTP_PROXY` / `ALL_PROXY` / `BEAMSYNC_PROXY` applies (pinning and
+ * SNI-free mode are preserved end-to-end inside the tunnel), otherwise the pinned
+ * direct agent, otherwise Node's default.
+ */
+export function selectTransportAgent(
+  targetUrl: string | URL,
+  pin: { certSha256?: string; noSni?: boolean } = {},
+  opts: { keepAlive?: boolean } = {},
+): http.Agent | undefined {
+  const u = typeof targetUrl === "string" ? new URL(targetUrl) : targetUrl;
+  const secure = u.protocol === "https:" || u.protocol === "wss:";
+  const proxy = resolveProxyForUrl(u);
+  if (proxy) {
+    return createProxyTunnelAgent({
+      proxy,
+      secure,
+      certSha256: pin.certSha256,
+      noSni: pin.noSni,
+      keepAlive: opts.keepAlive,
+    });
+  }
+  return secure ? createEdgeRelayHttpsAgent(pin) : undefined;
+}
+
 async function httpProbeOnce(
   node: EdgeRelayNodeInfo,
   timeoutMs: number,
 ): Promise<number> {
   const probeUrl = new URL(`${node.httpUrl.replace(/\/+$/, "")}/probe`);
   const isHttps = probeUrl.protocol === "https:";
-  const agent = isHttps
-    ? createEdgeRelayHttpsAgent({
-        certSha256: node.certSha256,
-        noSni: node.noSni,
-      })
-    : undefined;
+  const agent = selectTransportAgent(probeUrl, {
+    certSha256: node.certSha256,
+    noSni: node.noSni,
+  });
 
   const t0 = performance.now();
   await new Promise<void>((resolve, reject) => {
@@ -355,13 +359,10 @@ export async function connectEdgeRelayBinaryChannel(params: {
 }): Promise<EdgeRelayBinaryChannel> {
   const timeoutMs = params.connectTimeoutMs ?? 8_000;
   const parsed = new URL(params.wsRelayUrl);
-  const agent =
-    parsed.protocol === "wss:"
-      ? createEdgeRelayHttpsAgent({
-          certSha256: params.certSha256,
-          noSni: params.noSni,
-        })
-      : undefined;
+  const agent = selectTransportAgent(parsed, {
+    certSha256: params.certSha256,
+    noSni: params.noSni,
+  });
 
   const ws = new WebSocket(params.wsRelayUrl, {
     maxPayload: 32 * 1024 * 1024,
@@ -462,6 +463,12 @@ export async function streamPackBatchesOverEdgeRelay(params: {
   maxInFlight?: number;
   simulateDropAfterPacks?: number;
   paceBytes?: (byteCount: number) => Promise<void>;
+  /**
+   * Polled at every pack boundary. Returning `true` stops feeding new packs, drains
+   * the in-flight window, and ends the relay stream cleanly so the caller can move
+   * the remaining batches onto a better path (hot upgrade to P2P).
+   */
+  shouldHandOff?: () => boolean;
   producePackAt: (batchIndex: number) => Promise<{ packId: string; wireBytes: Uint8Array }>;
 }): Promise<{
   allPackIds: Array<string | undefined>;
@@ -469,6 +476,7 @@ export async function streamPackBatchesOverEdgeRelay(params: {
   ackedPackIds: string[];
   wireBytesSent: number;
   interrupted: boolean;
+  handedOff: boolean;
 }> {
   const maxInFlight =
     params.simulateDropAfterPacks !== undefined
@@ -483,13 +491,15 @@ export async function streamPackBatchesOverEdgeRelay(params: {
   let inFlight = 0;
   let streamError: Error | null = null;
   let notifySlot = null as (() => void) | null;
+  let handedOff = false;
 
   const decoder = new TextDecoder();
 
   const ackReaderPromise = (async () => {
     while (ackedBatchIndices.size < params.totalBatches && !streamError) {
       try {
-        const frame = await params.channel.nextFrame(30_000);
+        // Generous: a bandwidth-capped sender may pause for a whole pack interval between ACKs
+        const frame = await params.channel.nextFrame(120_000);
         if (frame.type !== FRAME_PACK_ACK) {
           throw new Error(`Unexpected Edge Relay ACK frame type: ${frame.type}`);
         }
@@ -516,6 +526,11 @@ export async function streamPackBatchesOverEdgeRelay(params: {
       });
     }
     if (streamError) break;
+
+    if (params.shouldHandOff?.()) {
+      handedOff = true;
+      break;
+    }
 
     if (
       params.simulateDropAfterPacks !== undefined &&
@@ -547,6 +562,33 @@ export async function streamPackBatchesOverEdgeRelay(params: {
     }
   }
 
+  if (handedOff && !streamError) {
+    // Drain the in-flight window so every pack already on the relay is acknowledged,
+    // then end the relay stream; un-fed batches continue on the upgraded path.
+    const drainDeadline = Date.now() + 15_000;
+    while (inFlight > 0 && !streamError && Date.now() < drainDeadline) {
+      await new Promise<void>((r) => {
+        notifySlot = r;
+        setTimeout(r, 250);
+      });
+    }
+    try {
+      await params.channel.sendFrame(FRAME_STREAM_END, new Uint8Array(0));
+    } catch {
+      // Relay already gone; unacknowledged batches are resent on the new path
+    }
+    params.channel.destroy();
+    await ackReaderPromise;
+    return {
+      allPackIds,
+      ackedBatchIndices,
+      ackedPackIds,
+      wireBytesSent,
+      interrupted: false,
+      handedOff: true,
+    };
+  }
+
   if (streamError) {
     params.channel.destroy();
   }
@@ -566,6 +608,7 @@ export async function streamPackBatchesOverEdgeRelay(params: {
     ackedPackIds,
     wireBytesSent,
     interrupted: Boolean(streamError) || ackedBatchIndices.size < params.totalBatches,
+    handedOff: false,
   };
 }
 
@@ -575,7 +618,7 @@ export async function receivePacksFromEdgeRelay(
 ): Promise<void> {
   const decoder = new TextDecoder();
   while (true) {
-    const frame = await channel.nextFrame(30_000);
+    const frame = await channel.nextFrame(120_000);
     if (frame.type === FRAME_STREAM_END) {
       return;
     }

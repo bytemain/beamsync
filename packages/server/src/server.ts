@@ -41,6 +41,8 @@ export interface BeamSyncServerConfig {
   publicStunHost?: string;
   extraStunServers?: string[];
   relayAuthSecret?: string;
+  /** Grace period before a peer without a signaling socket is reported as PEER_LOST (default 45 s). */
+  peerLossGraceMs?: number;
   initialEdgeRelays?: EdgeRelayNodeInfo[];
   apiToken?: string;
   r2?: R2StorageConfig;
@@ -116,6 +118,7 @@ export async function startBeamSyncServer(
     stunServers,
     relayAuthSecret,
     initialEdgeRelays: config.initialEdgeRelays,
+    peerLossGraceMs: config.peerLossGraceMs,
     persistence,
   });
   await coordinator.init();
@@ -382,6 +385,7 @@ export async function startBeamSyncServer(
     close: async () => {
       clearInterval(gcTimer);
       clearInterval(wsPingTimer);
+      coordinator.dispose();
       for (const client of wss.clients) {
         client.terminate();
       }
