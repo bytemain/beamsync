@@ -94,9 +94,18 @@ export async function encodePack(
   const indexLenBuf = new Uint8Array(4);
   new DataView(indexLenBuf.buffer).setUint32(0, indexBytes.length, false);
 
-  const innerPlain = concatBytes(indexLenBuf, indexBytes, ...deduped);
+  // Not concatBytes(...deduped): a pack of very many small blobs would pass more arguments
+  // than the call stack allows.
+  const innerPlain = new Uint8Array(4 + indexBytes.length + offset);
+  innerPlain.set(indexLenBuf, 0);
+  innerPlain.set(indexBytes, 4);
+  let writeOffset = 4 + indexBytes.length;
+  for (const data of deduped) {
+    innerPlain.set(data, writeOffset);
+    writeOffset += data.length;
+  }
 
-  let processed = innerPlain;
+  let processed: Uint8Array = innerPlain;
   const compCode = options.compression === "zstd" ? 1 : 0;
   if (options.compression === "zstd") {
     if (!options.zstdCompressFn) {

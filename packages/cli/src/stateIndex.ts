@@ -70,6 +70,8 @@ export interface ScanWorkspaceOptions extends IgnoreOptions {
   cacheDir?: string;
   smallFileThresholdBytes?: number;
   cdcOptions?: FastCdcOptions;
+  /** Stops the walk before the next entry; the scan then rejects with `SCAN_ABORTED`. */
+  signal?: AbortSignal;
 }
 
 export interface ScanWorkspaceResult {
@@ -279,6 +281,7 @@ export async function scanWorkspace(
         if (!decision.builtin) ignoredPathCount++;
         continue;
       }
+      if (options.signal?.aborted) throw new Error("SCAN_ABORTED: Workspace scan was cancelled");
       const childAbs = path.join(currentAbs, d.name);
       const st = await lstat(childAbs);
 

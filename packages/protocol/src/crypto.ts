@@ -137,6 +137,8 @@ export interface SessionKeyMaterial {
   confirmKeyTarget: Uint8Array;
   transportKey: Uint8Array;
   packKey: Uint8Array;
+  /** Seals control streams (manifest, known-blob list) that pass through the Coordinator. */
+  controlKey: Uint8Array;
   hostFingerprintKey: Uint8Array;
 }
 
@@ -153,6 +155,7 @@ export function deriveSessionKeyMaterial(
     confirmKeyTarget: hkdf(sha256, rootKey, salt, utf8Bytes("confirm:target"), 32),
     transportKey: hkdf(sha256, rootKey, salt, utf8Bytes("transport:aead"), 32),
     packKey: hkdf(sha256, rootKey, salt, utf8Bytes("pack:aead"), 32),
+    controlKey: hkdf(sha256, rootKey, salt, utf8Bytes("control:aead"), 32),
     hostFingerprintKey: hkdf(sha256, rootKey, salt, utf8Bytes("host:fingerprint"), 32),
   };
 }

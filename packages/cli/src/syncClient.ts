@@ -1,9 +1,12 @@
 import { open } from "node:fs/promises";
 import WebSocket from "ws";
 import {
+  BEAMSYNC_PROTOCOL_VERSION,
   bytesToHex,
   collectRequiredBlobHashes,
+  computeRootTreeDigest,
   constantTimeEqual,
+  controlStreamSegmentBytesFor,
   decodePack,
   deriveRendezvousSlot,
   deriveSessionKeyMaterial,
@@ -11,7 +14,11 @@ import {
   formatPairingPhrase,
   generateSecretWords,
   MAX_SIGNALING_MESSAGE_BYTES,
+  HaveBlobsStreamAssembler,
+  haveBlobsStreamRecords,
   hexToBytes,
+  ManifestStreamAssembler,
+  manifestStreamRecords,
   PakeHandshake,
   parsePairingPhrase,
   randomBytes,
@@ -47,6 +54,7 @@ import {
   type DiscoveredDirectAddress,
   type FramedSocketChannel,
 } from "./framedStream.js";
+import { readControlStream, writeControlStream } from "./controlStream.js";
 import { buildSessionHostFingerprint } from "./hostIdentity.js";
 import { httpRequestBytes } from "./httpClient.js";
 import { AtomicWorkspaceMaterializer } from "./materializer.js";
@@ -95,6 +103,13 @@ export interface TransferCommonOptions {
    * A larger message is refused locally instead of being rejected by the Coordinator.
    */
   maxSignalingMessageBytes?: number;
+  /**
+   * Uncompressed bytes per sealed control stream segment (manifest, known-blob list). Default
+   * 1 MiB, lowered automatically so a segment always fits in one signaling message.
+   */
+  controlStreamSegmentBytes?: number;
+  /** Segments a control stream writer may have in flight before waiting for the reader (default 8). */
+  controlStreamWindowSegments?: number;
   /** Disable probe-based UDP payload sizing and keep the conservative 1150-byte chunks. */
   disableUdpMtuProbe?: boolean;
   /** Do not ask the local gateway for a UDP port mapping (NAT-PMP). */
@@ -105,6 +120,8 @@ export interface TransferCommonOptions {
   allowLoopbackTcpForTest?: boolean;
   forceTier?: TransportTier;
   targetPackBytes?: number;
+  /** Most blobs packed together regardless of size (default 4096). */
+  maxBlobsPerPack?: number;
   streamRelayThresholdBytes?: number;
   uploadConcurrency?: number;
   downloadConcurrency?: number;
@@ -165,6 +182,12 @@ export interface SendTransferSummary {
   signalingReconnects: number;
   /** UDP chunk payload size in use (after path probing), when a UDP path was established. */
   udpChunkPayloadBytes?: number;
+  /** Entries (files, symlinks, empty directories) in the manifest sent to the target. */
+  manifestEntries: number;
+  /** Sealed signaling segments the manifest was split into. */
+  manifestSegments: number;
+  /** Sealed (compressed + encrypted) size of the manifest. */
+  manifestSealedBytes: number;
   /** Entries skipped by an ignore rule (an ignored directory counts once). */
   ignoredPaths: number;
   /** Workspace-relative ignore files that contributed rules. */
@@ -183,6 +206,10 @@ export interface ReceiveTransferSummary {
   packsApplied: number;
   firstPackAppliedAtMs: number | null;
   durationMs: number;
+  /** Entries in the manifest received from the source. */
+  manifestEntries: number;
+  /** Sealed signaling segments the manifest arrived in. */
+  manifestSegments: number;
   /** Target paths kept because the source's ignore rules cover them. */
   preservedIgnoredPaths: number;
   /** Ignored paths that could not be carried over; the previous tree is kept when non-empty. */
@@ -191,6 +218,7 @@ export interface ReceiveTransferSummary {
 }
 
 const DEFAULT_TARGET_PACK_BYTES = 8 * 1024 * 1024; // 8 MiB
+const DEFAULT_MAX_BLOBS_PER_PACK = 4096;
 const DEFAULT_STREAM_RELAY_THRESHOLD_BYTES = 8 * 1024 * 1024; // 8 MiB
 const DEFAULT_EDGE_RELAY_MAX_BYTES = 512 * 1024 * 1024; // 512 MiB default Edge Relay cut-through cap before R2_PIPELINE
 const RELAY_FRAME_SLICE_BYTES = 256 * 1024; // 256 KiB per WS frame
@@ -224,26 +252,16 @@ function createBandwidthPacer(
   };
 }
 
-/** Sends the plan, turning the generic size error into one that says what to do about it. */
-function sendTransferPlan(
-  sig: SignalingClient,
-  entryCount: number,
-  plan: Extract<ClientToServerWsMessage, { type: "source_transfer_plan" }>,
-): void {
-  try {
-    sig.send(plan);
-  } catch (err) {
-    if (err instanceof SignalingMessageTooLargeError) {
-      throw new Error(
-        `MANIFEST_TOO_LARGE: the transfer plan lists ${entryCount} entries and is ` +
-          `${formatMiB(err.messageBytes)}; one transfer can carry at most ${formatMiB(err.limitBytes)}. ` +
-          `Skip paths the target can regenerate (dependency folders, build output, caches) with ` +
-          `ignore rules: a .beamsyncignore file, --ignore-file <name>, --respect-gitignore or ` +
-          `--ignore <pattern>. "beamsync ignored <dir>" previews what would be skipped.`,
-      );
-    }
-    throw err;
-  }
+/** Fails right after pairing rather than letting two incompatible builds wait on each other. */
+function assertPeerProtocolVersion(peerVersion: number | undefined): void {
+  if (peerVersion === BEAMSYNC_PROTOCOL_VERSION) return;
+  throw new Error(
+    `PROTOCOL_VERSION_MISMATCH: this build speaks session protocol ${BEAMSYNC_PROTOCOL_VERSION}, ` +
+      (peerVersion === undefined
+        ? "the other peer or the Coordinator is an older build that does not announce a version"
+        : `the other peer speaks ${peerVersion}`) +
+      ". Run the same BeamSync version on both machines and on the server.",
+  );
 }
 
 export async function sendDirectory(
@@ -394,6 +412,8 @@ export async function receiveWithManagedLease(params: {
 
 const SIGNALING_KEEPALIVE_MS = 20_000;
 const SIGNALING_ACK_EVERY_MESSAGES = 32;
+/** Acknowledge after this many received bytes so the Coordinator can trim its replay log. */
+const SIGNALING_ACK_EVERY_BYTES = 2 * 1024 * 1024;
 const SIGNALING_OUTBOX_ACK_SOLICIT_BYTES = 4 * 1024 * 1024;
 const DEFAULT_SIGNALING_RECONNECT_BUDGET_MS = 30_000;
 /** Matches the Coordinator's pairing TTL: how long a peer waits for the other side to show up. */
@@ -443,6 +463,7 @@ class SignalingClient {
   private outboxBytesAtLastSolicit = 0;
   private lastServerSeq = 0;
   private receivedSinceAck = 0;
+  private receivedBytesSinceAck = 0;
 
   /** Number of successful signaling re-attachments during this session. */
   reconnectCount = 0;
@@ -451,7 +472,8 @@ class SignalingClient {
   private constructor(
     private readonly wsUrl: string,
     private readonly reconnectBudgetMs: number,
-    private readonly maxMessageBytes: number,
+    /** Largest message `send` accepts. */
+    readonly maxMessageBytes: number,
   ) {}
 
   static async connect(
@@ -506,13 +528,16 @@ class SignalingClient {
       } catch {
         return;
       }
-      this.handleIncoming(parsed);
+      this.handleIncoming(parsed, str.length);
     });
     ws.on("close", () => this.handleSocketLost(ws));
     ws.on("error", () => this.handleSocketLost(ws));
   }
 
-  private handleIncoming(parsed: ServerToClientWsMessage & { sseq?: number }): void {
+  private handleIncoming(
+    parsed: ServerToClientWsMessage & { sseq?: number },
+    wireChars: number,
+  ): void {
     if (parsed.type === "pong") {
       if (typeof parsed.ackSeq === "number") this.trimOutbox(parsed.ackSeq);
       return;
@@ -530,7 +555,11 @@ class SignalingClient {
       }
       this.lastServerSeq = parsed.sseq;
       this.receivedSinceAck++;
-      if (this.receivedSinceAck >= SIGNALING_ACK_EVERY_MESSAGES) {
+      this.receivedBytesSinceAck += wireChars;
+      if (
+        this.receivedSinceAck >= SIGNALING_ACK_EVERY_MESSAGES ||
+        this.receivedBytesSinceAck >= SIGNALING_ACK_EVERY_BYTES
+      ) {
         this.sendAckPing();
       }
     }
@@ -570,6 +599,7 @@ class SignalingClient {
 
   private sendAckPing(): void {
     this.receivedSinceAck = 0;
+    this.receivedBytesSinceAck = 0;
     this.rawSend(
       JSON.stringify({ type: "ping", ts: Date.now(), ackSeq: this.lastServerSeq }),
     );
@@ -799,9 +829,14 @@ async function runSourceSession(params: {
       .filter((u): u is string => Boolean(u)),
   ];
 
+  // A session that ends early must not leave a scan walking the tree in the background
+  const scanAbort = new AbortController();
+  let scanSettled: Promise<unknown> = Promise.resolve();
+
   try {
     // Start scanning source workspace and probing Edge Relay RTTs immediately in parallel
     const sourceScanPromise = scanWorkspace(options.sourceDir, {
+      signal: scanAbort.signal,
       cacheDir: options.cacheDir,
       extraIgnoreRules: options.extraIgnoreRules,
       ignoreFileNames: options.ignoreFileNames,
@@ -810,6 +845,7 @@ async function runSourceSession(params: {
       smallFileThresholdBytes: options.smallFileThresholdBytes,
       cdcOptions: options.cdcOptions,
     });
+    scanSettled = sourceScanPromise.catch(() => {});
     const relayRttPromise = options.disableEdgeRelay
       ? Promise.resolve<Record<string, number>>({})
       : probeEdgeRelayRtts(edgeRelays, 1000);
@@ -884,9 +920,20 @@ async function runSourceSession(params: {
 
     const relayRttMs = await relayRttPromise;
     const peerConfirmedPromise = sig.waitFor("peer_confirmed", 20_000);
+    const controlSegmentBytes = controlStreamSegmentBytesFor(
+      sig.maxMessageBytes,
+      options.controlStreamSegmentBytes,
+    );
     // Unbounded: the target may be hashing an existing multi-GB directory before it answers
-    const targetBlobsPromise = sig.waitFor("target_have_blobs", 0);
-    targetBlobsPromise.catch(() => {});
+    const haveBlobsAssembler = new HaveBlobsStreamAssembler();
+    const targetBlobsReader = readControlStream({
+      sig,
+      stream: "have_blobs",
+      controlKey: keys.controlKey,
+      sessionId,
+      onRecord: (record) => haveBlobsAssembler.acceptRecord(record),
+    });
+    targetBlobsReader.done.catch(() => {});
 
     sig.send({
       type: "pake_confirm",
@@ -895,6 +942,7 @@ async function runSourceSession(params: {
       candidates: udpPrep ? udpPrep.candidates : [],
       relayRttMs,
       natMapping: udpPrep?.natMapping,
+      protocolVersion: BEAMSYNC_PROTOCOL_VERSION,
     });
 
     const peerConfirmed = await peerConfirmedPromise;
@@ -906,6 +954,7 @@ async function runSourceSession(params: {
     ) {
       throw new Error("PAKE_AUTH_FAILED: Pairing phrase mismatch");
     }
+    assertPeerProtocolVersion(peerConfirmed.peerProtocolVersion);
 
     // Direct-path discovery starts the moment both peers are authenticated and runs in the
     // background, concurrently with the workspace scan and (later) with Edge Relay streaming:
@@ -977,12 +1026,37 @@ async function runSourceSession(params: {
       })();
     }
 
-    const [sourceScan, targetHaveMsg] = await Promise.all([
-      sourceScanPromise,
-      targetBlobsPromise,
-    ]);
+    // The manifest does not depend on what the target already has, so it is sealed and sent
+    // as soon as the scan is done, while the target may still be hashing its existing tree.
+    const manifestSentPromise = sourceScanPromise.then(async (scan) => {
+      options.onProgress?.({
+        phase: "manifest_sending",
+        detail: `entries=${scan.manifest.entries.length}`,
+      });
+      const stats = await writeControlStream({
+        sig,
+        stream: "manifest",
+        controlKey: keys.controlKey,
+        sessionId,
+        segmentBytes: controlSegmentBytes,
+        windowSegments: options.controlStreamWindowSegments,
+        records: manifestStreamRecords(
+          scan.manifest,
+          scan.rootTreeDigest,
+          scan.ignoreSpec.layers.length > 0 ? scan.ignoreSpec : undefined,
+        ),
+      });
+      options.onProgress?.({
+        phase: "manifest_sent",
+        detail: `entries=${scan.manifest.entries.length} segments=${stats.segments} sealed=${stats.sealedBytes} B`,
+      });
+      return stats;
+    });
+    manifestSentPromise.catch(() => {});
 
-    const targetKnownSet = new Set(targetHaveMsg.knownBlobHashes);
+    const [sourceScan] = await Promise.all([sourceScanPromise, targetBlobsReader.done]);
+
+    const targetKnownSet = haveBlobsAssembler.finish();
     const allRequiredHashes = collectRequiredBlobHashes(sourceScan.manifest);
     let totalRequiredBytes = 0;
     let missingBytesEstimate = 0;
@@ -1107,9 +1181,12 @@ async function runSourceSession(params: {
     const committedPromise = sig.waitFor("session_committed", 0);
     committedPromise.catch(() => {});
 
-    sendTransferPlan(sig, sourceScan.manifest.entries.length, {
+    // The plan follows the last manifest segment on the same ordered channel, so the target
+    // always holds the complete manifest by the time it sees the plan.
+    const manifestStats = await manifestSentPromise;
+    sig.send({
       type: "source_transfer_plan",
-      manifest: sourceScan.manifest,
+      manifestEntryCount: sourceScan.manifest.entries.length,
       rootTreeDigest: sourceScan.rootTreeDigest,
       missingBlobCount: missingHashes.length,
       missingBytesEstimate,
@@ -1118,8 +1195,6 @@ async function runSourceSession(params: {
       directUpgradePending: pendingDirectUpgrade ? true : undefined,
       directChannel:
         selectedTier === "P2P_DIRECT" ? (udpChan ? "udp" : "tcp") : undefined,
-      ignoreSpec:
-        sourceScan.ignoreSpec.layers.length > 0 ? sourceScan.ignoreSpec : undefined,
     });
 
     const targetPackBytes = options.targetPackBytes ?? DEFAULT_TARGET_PACK_BYTES;
@@ -1132,6 +1207,7 @@ async function runSourceSession(params: {
       missingHashes,
       sourceScan.blobSlices,
       targetPackBytes,
+      Math.max(1, Math.floor(options.maxBlobsPerPack ?? DEFAULT_MAX_BLOBS_PER_PACK)),
     );
 
     if (selectedTier === "LOCAL_IPC" && directSock) {
@@ -1482,11 +1558,15 @@ async function runSourceSession(params: {
       packsViaEdgeRelay,
       packsViaDirect,
       signalingReconnects: sig.reconnectCount,
+      manifestEntries: sourceScan.manifest.entries.length,
+      manifestSegments: manifestStats.segments,
+      manifestSealedBytes: manifestStats.sealedBytes,
       udpChunkPayloadBytes: udpChan?.chunkPayloadBytes,
       ignoredPaths: sourceScan.ignoredPathCount,
       ignoreFilesLoaded: sourceScan.ignoreFilesLoaded,
     };
   } finally {
+    scanAbort.abort();
     directAbort.abort();
     // Release a direct path that finished connecting but was never adopted
     void directAttemptPromise?.then(destroyDirectPath, () => {});
@@ -1495,6 +1575,7 @@ async function runSourceSession(params: {
     udpChan?.destroy();
     await udpPrep?.close();
     sig.close();
+    await scanSettled;
   }
 }
 
@@ -1533,13 +1614,19 @@ async function runTargetSession(params: {
       .filter((u): u is string => Boolean(u)),
   ];
 
+  // A session that ends early must not leave a scan hashing the old tree in the background
+  const scanAbort = new AbortController();
+  let scanSettled: Promise<unknown> = Promise.resolve();
+
   try {
     // Scan existing target directory and probe Edge Relay RTTs in parallel
     const existingTargetScanPromise = scanWorkspace(options.targetDir, {
+      signal: scanAbort.signal,
       cacheDir: options.cacheDir,
       smallFileThresholdBytes: options.smallFileThresholdBytes,
       cdcOptions: options.cdcOptions,
     }).catch(() => null);
+    scanSettled = existingTargetScanPromise;
     const relayRttPromise = options.disableEdgeRelay
       ? Promise.resolve<Record<string, number>>({})
       : probeEdgeRelayRtts(edgeRelays, 1000);
@@ -1628,6 +1715,17 @@ async function runTargetSession(params: {
 
     const relayRttMs = await relayRttPromise;
     const peerConfirmedPromise = sig.waitFor("peer_confirmed", 20_000);
+    // Listening from the start: the source may send its manifest while this side is still
+    // hashing the existing target tree.
+    const manifestAssembler = new ManifestStreamAssembler();
+    const manifestReader = readControlStream({
+      sig,
+      stream: "manifest",
+      controlKey: keys.controlKey,
+      sessionId,
+      onRecord: (record) => manifestAssembler.acceptRecord(record),
+    });
+    manifestReader.done.catch(() => {});
     sig.send({
       type: "pake_confirm",
       confirmMacHex: myConfirmMacHex,
@@ -1638,6 +1736,7 @@ async function runTargetSession(params: {
       ],
       relayRttMs,
       natMapping: udpPrep?.natMapping,
+      protocolVersion: BEAMSYNC_PROTOCOL_VERSION,
     });
 
     const peerConfirmed = await peerConfirmedPromise;
@@ -1649,6 +1748,7 @@ async function runTargetSession(params: {
     ) {
       throw new Error("PAKE_AUTH_FAILED: Pairing phrase mismatch");
     }
+    assertPeerProtocolVersion(peerConfirmed.peerProtocolVersion);
 
     let pendingUdpPunchPromise: Promise<UdpHolePunchChannel | null> | null = null;
     if (
@@ -1672,7 +1772,7 @@ async function runTargetSession(params: {
     const existingBlobs =
       existingScan?.blobSlices ?? new Map<string, BlobDiskSlice>();
 
-    // Subscribe to transfer plan, R2 pack notifications, relay frames, and commit grant BEFORE sending target_have_blobs
+    // Subscribe to transfer plan, R2 pack notifications, relay frames, and commit grant BEFORE writing the have_blobs stream
     const r2Queue: Array<{ packId: string; getUrl: string }> = [];
     let notifyR2Queue = null as (() => void) | null;
     const relayChunks = new Map<
@@ -1739,21 +1839,58 @@ async function runTargetSession(params: {
     // Unbounded: the source may still be scanning tens of thousands of files
     const planPromise = sig.waitFor("source_transfer_plan", 0);
     planPromise.catch(() => {});
-    sig.send({
-      type: "target_have_blobs",
-      knownBlobHashes: Array.from(existingBlobs.keys()),
+    const haveBlobsStats = await writeControlStream({
+      sig,
+      stream: "have_blobs",
+      controlKey: keys.controlKey,
+      sessionId,
+      segmentBytes: controlStreamSegmentBytesFor(
+        sig.maxMessageBytes,
+        options.controlStreamSegmentBytes,
+      ),
+      windowSegments: options.controlStreamWindowSegments,
+      records: haveBlobsStreamRecords(existingBlobs.keys(), existingBlobs.size),
+    });
+    options.onProgress?.({
+      phase: "have_blobs_sent",
+      detail: `blobs=${existingBlobs.size} segments=${haveBlobsStats.segments} sealed=${haveBlobsStats.sealedBytes} B`,
     });
 
-    const plan = await planPromise;
+    const [plan, manifestStats] = await Promise.all([
+      planPromise.then((p) => {
+        // The plan is sent after the last manifest segment on the same ordered channel
+        manifestReader.expectComplete();
+        return p;
+      }),
+      manifestReader.done,
+    ]);
+    const { header: manifestHeader, manifest } = manifestAssembler.finish();
+    if (
+      manifestHeader.rootTreeDigest !== plan.rootTreeDigest ||
+      manifestHeader.entryCount !== plan.manifestEntryCount
+    ) {
+      throw new Error(
+        "MANIFEST_INTEGRITY: the transfer plan does not match the manifest the source sealed",
+      );
+    }
+    if (computeRootTreeDigest(manifest) !== manifestHeader.rootTreeDigest) {
+      throw new Error(
+        "MANIFEST_INTEGRITY: the received manifest does not hash to the digest the source sealed",
+      );
+    }
+    options.onProgress?.({
+      phase: "manifest_received",
+      detail: `entries=${manifest.entries.length} segments=${manifestStats.segments} sealed=${manifestStats.sealedBytes} B`,
+    });
 
     let selectedTier = plan.selectedTier;
     materializer = new AtomicWorkspaceMaterializer({
       targetDir: options.targetDir,
       sessionId,
-      manifest: plan.manifest,
-      rootTreeDigest: plan.rootTreeDigest,
+      manifest,
+      rootTreeDigest: manifestHeader.rootTreeDigest,
       existingBlobs,
-      ignoreSpec: plan.ignoreSpec,
+      ignoreSpec: manifestHeader.ignoreSpec,
       deleteIgnored: options.deleteIgnored,
     });
     await materializer.prepareStaging();
@@ -2036,6 +2173,8 @@ async function runTargetSession(params: {
       committedFiles,
       upgradedToDirect,
       signalingReconnects: sig.reconnectCount,
+      manifestEntries: manifest.entries.length,
+      manifestSegments: manifestStats.segments,
       packsApplied: appliedPackIds.size,
       firstPackAppliedAtMs,
       durationMs: Date.now() - startedAt,
@@ -2047,12 +2186,14 @@ async function runTargetSession(params: {
     await materializer?.abort();
     throw err;
   } finally {
+    scanAbort.abort();
     punchAbort.abort();
     edgeChan?.destroy();
     udpChan?.destroy();
     await udpPrep?.close();
     await directListeners?.closeAll();
     sig.close();
+    await scanSettled;
   }
 }
 
@@ -2060,6 +2201,7 @@ function buildMissingBlobBatches(
   missingHashes: string[],
   blobSlices: ReadonlyMap<string, BlobDiskSlice>,
   targetPackBytes: number,
+  maxBlobsPerPack: number = DEFAULT_MAX_BLOBS_PER_PACK,
 ): string[][] {
   const batches: string[][] = [];
   let current: string[] = [];
@@ -2067,7 +2209,12 @@ function buildMissingBlobBatches(
 
   for (const hash of missingHashes) {
     const len = blobSlices.get(hash)?.length ?? 0;
-    if (current.length > 0 && currentBytes + len > targetPackBytes) {
+    // The blob cap keeps a tree of tiny files from becoming one pack whose index dwarfs its
+    // data and whose loss would mean resending everything.
+    if (
+      current.length > 0 &&
+      (currentBytes + len > targetPackBytes || current.length >= maxBlobsPerPack)
+    ) {
       batches.push(current);
       current = [];
       currentBytes = 0;

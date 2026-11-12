@@ -3,9 +3,20 @@ import { mkdir, mkdtemp, readdir, rm, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import WebSocket from "ws";
-import { MAX_SIGNALING_MESSAGE_BYTES } from "@beamsync/protocol";
+import {
+  MAX_SIGNALING_MESSAGE_BYTES,
+  blake3Hex,
+  decodePack,
+  encodePack,
+} from "@beamsync/protocol";
 import { startBeamSyncServer, type RunningBeamSyncServer } from "@beamsync/server";
-import { receiveDirectory, sendDirectory } from "@beamsync/cli";
+import {
+  receiveDirectory,
+  scanWorkspace,
+  sendDirectory,
+  zstdCompress,
+  zstdDecompress,
+} from "@beamsync/cli";
 
 describe("workspaces with very many entries", () => {
   let tmpRoot: string;
@@ -64,61 +75,74 @@ describe("workspaces with very many entries", () => {
     expect(received.rootTreeDigest).toBe((await sendPromise).rootTreeDigest);
   });
 
-  it("fails fast with an ignore hint when the plan does not fit in one signaling message, and works once the bulk is ignored", async () => {
+  it("packs more small blobs than a function call can take arguments", async () => {
+    const blobs = Array.from({ length: 200_000 }, (_, i) => {
+      const data = new Uint8Array([i & 0xff, (i >> 8) & 0xff, (i >> 16) & 0xff]);
+      return { hash: blake3Hex(data), data };
+    });
+    const packKey = new Uint8Array(32).fill(3);
+    const pack = await encodePack(blobs, {
+      compression: "zstd",
+      encryption: "chacha20-poly1305",
+      packKey,
+      zstdCompressFn: zstdCompress,
+    });
+    expect(pack.blobCount).toBe(200_000);
+    const decoded = await decodePack(pack.wireBytes, {
+      expectedPackId: pack.packId,
+      packKey,
+      zstdDecompressFn: zstdDecompress,
+    });
+    expect(decoded.blobs.length).toBe(200_000);
+    expect(Array.from(decoded.blobs[199_999].data)).toEqual(Array.from(blobs[199_999].data));
+  });
+
+  it("splits a tree of tiny files into several packs instead of one pack per 8 MiB", async () => {
     const sourceDir = path.join(tmpRoot, "src");
-    const deps = path.join(sourceDir, "node_modules", "pkg");
-    await mkdir(deps, { recursive: true });
-    for (let i = 0; i < 300; i++) {
-      await writeFile(path.join(deps, `module-${i}.js`), `// ${i}\n`);
+    await mkdir(sourceDir, { recursive: true });
+    for (let i = 0; i < 1000; i++) {
+      await writeFile(path.join(sourceDir, `f-${i}.txt`), `tiny ${i}\n`);
     }
-    await writeFile(path.join(sourceDir, "main.ts"), "main\n");
-
-    const run = async (extraIgnoreRules: string[], targetName: string) => {
-      let resolveCode!: (code: string) => void;
-      const codePromise = new Promise<string>((r) => {
-        resolveCode = r;
-      });
-      const progress: string[] = [];
-      const sendPromise = sendDirectory({
-        serverUrl: server.httpUrl,
-        sourceDir,
-        cacheDir: path.join(tmpRoot, "c1"),
-        hostIdOverride: "large-host",
-        // Stand-in for the 32 MiB limit so the test does not need 200k files
-        maxSignalingMessageBytes: 16 * 1024,
-        extraIgnoreRules,
-        onPairingCode: resolveCode,
-        onProgress: (ev) => progress.push(ev.phase),
-      });
-      sendPromise.catch(() => {});
-      const receivePromise = receiveDirectory({
-        serverUrl: server.httpUrl,
-        targetDir: path.join(tmpRoot, targetName),
-        pairingCode: await codePromise,
-        cacheDir: path.join(tmpRoot, "c2"),
-        hostIdOverride: "large-host",
-      });
-      receivePromise.catch(() => {});
-      return { sendPromise, receivePromise, progress };
-    };
-
-    const startedAt = Date.now();
-    const tooLarge = await run([], "dst-too-large");
-    await expect(tooLarge.sendPromise).rejects.toThrow(
-      /MANIFEST_TOO_LARGE: the transfer plan lists 301 entries.*ignore rules/s,
-    );
-    expect(Date.now() - startedAt).toBeLessThan(10_000);
-    // Refused locally: the socket was never dropped and resumed
-    expect(tooLarge.progress).not.toContain("signaling_resumed");
-    // The waiting receiver is told the sender is gone instead of hanging
-    await expect(tooLarge.receivePromise).rejects.toThrow(/PEER_LOST/);
-    expect((await readdir(tmpRoot)).filter((n) => n.includes("dst-too-large"))).toEqual([]);
-
-    const trimmed = await run(["node_modules/"], "dst-trimmed");
-    const sent = await trimmed.sendPromise;
-    const received = await trimmed.receivePromise;
-    expect(sent.ignoredPaths).toBe(1);
+    let resolveCode!: (code: string) => void;
+    const codePromise = new Promise<string>((r) => {
+      resolveCode = r;
+    });
+    const sendPromise = sendDirectory({
+      serverUrl: server.httpUrl,
+      sourceDir,
+      cacheDir: path.join(tmpRoot, "c1"),
+      hostIdOverride: "large-host",
+      maxBlobsPerPack: 300,
+      onPairingCode: resolveCode,
+    });
+    const received = await receiveDirectory({
+      serverUrl: server.httpUrl,
+      targetDir: path.join(tmpRoot, "dst"),
+      pairingCode: await codePromise,
+      cacheDir: path.join(tmpRoot, "c2"),
+      hostIdOverride: "large-host",
+    });
+    const sent = await sendPromise;
+    expect(sent.packCount).toBe(4);
+    expect(received.packsApplied).toBe(4);
+    expect(received.committedFiles).toBe(1000);
     expect(received.rootTreeDigest).toBe(sent.rootTreeDigest);
-    expect(await readdir(path.join(tmpRoot, "dst-trimmed"))).toEqual([".beamsync", "main.ts"]);
+  });
+
+  it("a cancelled scan stops walking and leaves no index behind", async () => {
+    const dir = path.join(tmpRoot, "scan-src");
+    const cacheDir = path.join(tmpRoot, "scan-cache");
+    await mkdir(dir, { recursive: true });
+    for (let i = 0; i < 400; i++) await writeFile(path.join(dir, `f${i}.txt`), `c${i}\n`);
+
+    const abort = new AbortController();
+    const scan = scanWorkspace(dir, { cacheDir, signal: abort.signal });
+    abort.abort();
+    await expect(scan).rejects.toThrow(/SCAN_ABORTED/);
+    expect(await readdir(cacheDir)).toEqual([]);
+
+    const full = await scanWorkspace(dir, { cacheDir, signal: new AbortController().signal });
+    expect(full.manifest.entries.length).toBe(400);
+    expect(full.hashedFiles).toBe(400);
   });
 });

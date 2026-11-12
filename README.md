@@ -21,6 +21,9 @@ Run `beamsync-server` (bound to Cloudflare R2) plus optional regional `beamsync-
 - **Small-File & Large-File Engine (`BMSP` Packs + FastCDC)**:
   - Persistent local `(ino, size, mtimeNs, ctimeNs)` stat cache avoids re-hashing unchanged files across tens of thousands of source files.
   - Small files (`<= 256 KiB`) are whole-file BLAKE3-hashed and coalesced into `~8 MiB` `zstd`-compressed, `ChaCha20-Poly1305`-encrypted `BMSP` packs; large files (`> 256 KiB`) are split with Gear-based FastCDC (`64 KiB–1 MiB`) so single-line edits only transmit changed chunks.
+- **No File-Count Ceiling (Sealed Control Streams)**:
+  - The file list and the receiver's list of blobs it already has are streamed in `1 MiB` segments with an `8`-segment window, instead of travelling as one message. A tree of `220,002` files was transferred end to end; before this, the same tree was refused at about `160,000` entries.
+  - Every segment is compressed and encrypted between the two peers, so the Coordinator relays file names, sizes, hashes, and ignore rules without being able to read or change them. A segment that is altered, dropped, reordered, or replayed fails the transfer before the receiver's directory is touched.
 - **Sender-Side Ignore Rules (`.gitignore` syntax)**:
   - `.beamsyncignore` files are read in every directory of the source. Any other file name can be added with `--ignore-file <name>` (for example `--ignore-file .raftmigrationignore`), and `.gitignore` files are honoured with `--respect-gitignore`.
   - Ignored directories are never entered, read, or hashed. The receiver keeps its own copies of paths the sender ignored instead of deleting them; `--delete-ignored` on the receiver turns the transfer into an exact mirror.
@@ -212,12 +215,14 @@ build/
 - UDP payload sizing probes a fixed list of sizes (`1420`, `1380`, `1340`, `1300`, `1232`) once after the punch. It is not continuous path-MTU discovery, and hosts that fragment oversized datagrams locally can still pass a probe.
 - Port mapping speaks NAT-PMP only (no UPnP IGD or PCP), maps UDP only, and has been tested against a protocol-level mock gateway, not against physical routers.
 - UDP candidates are IPv4 only. There is no QUIC transport, and the Coordinator, Edge Relay, and STUN listeners do not share a single port.
-- The whole manifest travels in one signaling message, capped at `32 MiB` (about `205` bytes per entry in a measured tree, so roughly `160,000` files). A larger tree is refused before streaming with `MANIFEST_TOO_LARGE`; ignore rules are currently the only way to bring the entry count down.
+- There is no protocol limit on the number of files, but both sides keep the whole file list in memory and the local index cache is a single JSON document. Measured on a `220,002`-file tree: peak memory `742 MB` on the sender and `806 MB` on the receiver. Trees beyond a few hundred thousand files have not been transferred end to end; ignore rules remain the way to keep dependency and build output out of the count.
+- A single file larger than `2 GiB` stops the scan (`ERR_FS_FILE_TOO_LARGE`), because the scanner reads each file in one call. Exclude such files with an ignore rule for now.
+- Sender, receiver, and server must run the same session protocol version (currently `2`). A mismatch stops the transfer right after pairing with `PROTOCOL_VERSION_MISMATCH`. Builds from before this version do not announce one: the newer side reports the mismatch, and the older side's behaviour has not been tested.
 - The scan stops on the first path it cannot represent: an absolute symlink, a symlink that points outside the source directory, or a file or directory the user cannot read. Exclude such paths with an ignore rule. Sockets, FIFOs, and device nodes are skipped without a message.
 - The scan follows the directory tree across mount points; there is no one-file-system option.
 - Permission bits are transferred for files and for empty directories only. A non-empty directory is created with the receiver's default mode.
 - The receiver hashes its existing directory before it learns the sender's ignore rules, so paths the sender ignores are hashed there without being used.
-- File paths and ignore rules are part of the transfer plan, which the Coordinator relays unencrypted; only file contents are end-to-end encrypted.
+- The Coordinator cannot read file names or ignore rules, but it still sees the number of entries, the tree digest, how much data is missing on the receiver, and which transport tier is used. It can also stall a transfer by not forwarding messages.
 
 ---
 

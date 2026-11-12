@@ -1,4 +1,5 @@
 export * from "./zstdCodec.js";
+export * from "./controlStream.js";
 export * from "./hostIdentity.js";
 export * from "./stunClient.js";
 export * from "./stateIndex.js";

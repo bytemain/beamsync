@@ -2,14 +2,21 @@ import type {
   EdgeRelayNodeInfo,
   SignedEdgeRelayAllocation,
 } from "./edgeRelayTicket.js";
-import type { IgnoreSpec } from "./ignore.js";
-import type { TreeManifest } from "./manifest.js";
+import type { ControlStreamName } from "./controlStream.js";
 
 /**
- * Largest signaling message the Coordinator accepts. The transfer plan (the whole manifest)
- * travels as one message, which bounds how many entries a single transfer can carry.
+ * Largest signaling message the Coordinator accepts. Data that can grow with the workspace (the
+ * manifest, the target's known blob list) is split across messages as a sealed control stream.
  */
 export const MAX_SIGNALING_MESSAGE_BYTES = 32 * 1024 * 1024;
+
+/**
+ * Version of the peer-to-peer session protocol. Peers exchange it through the Coordinator and
+ * refuse to continue on a mismatch, instead of waiting for messages the other side never sends.
+ *
+ * - 2: manifest and known-blob list travel as sealed control streams
+ */
+export const BEAMSYNC_PROTOCOL_VERSION = 2;
 
 export type TransportTier =
   | "LOCAL_IPC"
@@ -125,14 +132,32 @@ export type ClientToServerWsMessage =
       candidates: EndpointCandidate[];
       relayRttMs?: Record<string, number>;
       natMapping?: NatMappingBehavior;
+      protocolVersion?: number;
     }
   | {
-      type: "target_have_blobs";
-      knownBlobHashes: string[];
+      /**
+       * One sealed segment of a control stream (see `controlStream.ts`). The Coordinator forwards
+       * it to the other peer and cannot read it.
+       */
+      type: "control_stream_chunk";
+      stream: ControlStreamName;
+      index: number;
+      final: boolean;
+      payloadBase64: string;
     }
   | {
+      /** Flow control: the reader has processed every segment up to and including `index`. */
+      type: "control_stream_ack";
+      stream: ControlStreamName;
+      index: number;
+    }
+  | {
+      /**
+       * Sent after the sealed `manifest` control stream has been written in full. The manifest
+       * itself (paths, ignore rules) never appears in a message the Coordinator can read.
+       */
       type: "source_transfer_plan";
-      manifest: TreeManifest;
+      manifestEntryCount: number;
       rootTreeDigest: string;
       missingBlobCount: number;
       missingBytesEstimate: number;
@@ -142,11 +167,6 @@ export type ClientToServerWsMessage =
       directUpgradePending?: boolean;
       /** Which direct channel the source will write to when `selectedTier` is `P2P_DIRECT`. */
       directChannel?: DirectUpgradeChannelKind;
-      /**
-       * Ignore rules the source applied. The target uses them to keep its own copies of paths
-       * the source skipped instead of deleting them.
-       */
-      ignoreSpec?: IgnoreSpec;
     }
   | {
       type: "transport_ready";
@@ -221,15 +241,34 @@ export type ServerToClientWsMessage =
       sameHostMatch: boolean;
       peerCandidates: EndpointCandidate[];
       peerNatMapping?: NatMappingBehavior;
+      /** Absent when the peer, or the Coordinator relaying it, predates version negotiation. */
+      peerProtocolVersion?: number;
       selectedEdgeRelay?: SignedEdgeRelayAllocation;
     }
   | {
-      type: "target_have_blobs";
-      knownBlobHashes: string[];
+      /**
+       * One sealed segment of a control stream (see `controlStream.ts`). The Coordinator forwards
+       * it to the other peer and cannot read it.
+       */
+      type: "control_stream_chunk";
+      stream: ControlStreamName;
+      index: number;
+      final: boolean;
+      payloadBase64: string;
     }
   | {
+      /** Flow control: the reader has processed every segment up to and including `index`. */
+      type: "control_stream_ack";
+      stream: ControlStreamName;
+      index: number;
+    }
+  | {
+      /**
+       * Sent after the sealed `manifest` control stream has been written in full. The manifest
+       * itself (paths, ignore rules) never appears in a message the Coordinator can read.
+       */
       type: "source_transfer_plan";
-      manifest: TreeManifest;
+      manifestEntryCount: number;
       rootTreeDigest: string;
       missingBlobCount: number;
       missingBytesEstimate: number;
@@ -239,11 +278,6 @@ export type ServerToClientWsMessage =
       directUpgradePending?: boolean;
       /** Which direct channel the source will write to when `selectedTier` is `P2P_DIRECT`. */
       directChannel?: DirectUpgradeChannelKind;
-      /**
-       * Ignore rules the source applied. The target uses them to keep its own copies of paths
-       * the source skipped instead of deleting them.
-       */
-      ignoreSpec?: IgnoreSpec;
     }
   | {
       type: "transport_ready";

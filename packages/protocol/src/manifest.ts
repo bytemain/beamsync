@@ -1,4 +1,5 @@
-import { blake3Hex, utf8Bytes } from "./crypto.js";
+import { blake3 } from "@noble/hashes/blake3";
+import { bytesToHex, utf8Bytes } from "./crypto.js";
 
 export interface FileChunkRef {
   hash: string;
@@ -94,36 +95,57 @@ export function canonicalizeManifest(manifest: TreeManifest): TreeManifest {
   };
 }
 
-export function computeRootTreeDigest(manifest: TreeManifest): string {
-  const canonical = canonicalizeManifest(manifest);
+function digestProjection(entry: ManifestEntry): unknown {
   // Exclude volatile mtimeMs on directories so identical directory trees hash deterministically,
   // while keeping file content hashes, modes, hardlinks, and symlink targets strictly bound.
-  const digestProjection = canonical.entries.map((entry) => {
-    if (entry.kind === "file") {
-      return {
-        k: "f",
-        p: entry.relPath,
-        s: entry.size,
-        m: entry.mode & 0o777,
-        b: entry.blobHash ?? null,
-        c: entry.chunks ?? null,
-        h: entry.hardlinkGroupId ?? null,
-      };
-    }
-    if (entry.kind === "symlink") {
-      return {
-        k: "l",
-        p: entry.relPath,
-        t: entry.linkTarget,
-      };
-    }
+  if (entry.kind === "file") {
     return {
-      k: "d",
+      k: "f",
       p: entry.relPath,
+      s: entry.size,
       m: entry.mode & 0o777,
+      b: entry.blobHash ?? null,
+      c: entry.chunks ?? null,
+      h: entry.hardlinkGroupId ?? null,
     };
-  });
-  return blake3Hex(utf8Bytes(JSON.stringify(digestProjection)));
+  }
+  if (entry.kind === "symlink") {
+    return {
+      k: "l",
+      p: entry.relPath,
+      t: entry.linkTarget,
+    };
+  }
+  return {
+    k: "d",
+    p: entry.relPath,
+    m: entry.mode & 0o777,
+  };
+}
+
+const DIGEST_BATCH_ENTRIES = 4096;
+
+/**
+ * BLAKE3 over the JSON array of every entry's digest projection, in canonical path order.
+ * The array is hashed in batches, so a tree with millions of entries never has to exist as
+ * one string.
+ */
+export function computeRootTreeDigest(manifest: TreeManifest): string {
+  const entries = canonicalizeManifest(manifest).entries;
+  const hasher = blake3.create({});
+  hasher.update(utf8Bytes("["));
+  for (let start = 0; start < entries.length; start += DIGEST_BATCH_ENTRIES) {
+    const batch: unknown[] = [];
+    const end = Math.min(entries.length, start + DIGEST_BATCH_ENTRIES);
+    for (let i = start; i < end; i++) {
+      batch.push(digestProjection(entries[i]));
+    }
+    // "[a,b,c]" without its brackets is exactly this batch's share of the full array
+    const json = JSON.stringify(batch);
+    hasher.update(utf8Bytes((start > 0 ? "," : "") + json.slice(1, -1)));
+  }
+  hasher.update(utf8Bytes("]"));
+  return bytesToHex(hasher.digest());
 }
 
 export function collectRequiredBlobHashes(manifest: TreeManifest): Set<string> {

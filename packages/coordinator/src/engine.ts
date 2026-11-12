@@ -1,7 +1,9 @@
 import {
+  CONTROL_STREAM_WRITER_ROLE,
   buildSignedEdgeRelayWsUrl,
   bytesToHex,
   evaluateSessionEquilibrium,
+  isControlStreamName,
   mintEdgeRelayTicket,
   randomBytes,
   type AllocatedUploadSlot,
@@ -53,6 +55,7 @@ interface PeerRuntimeState {
   candidates: EndpointCandidate[];
   relayRttMs?: Record<string, number>;
   natMapping?: NatMappingBehavior;
+  protocolVersion?: number;
   /** Reliable signaling: next/last Coordinator -> peer sequence number. */
   outSeq: number;
   /** Un-acknowledged Coordinator -> peer messages kept for replay on resume. */
@@ -772,6 +775,8 @@ export class CoordinatorEngine {
         me.candidates = msg.candidates;
         me.relayRttMs = msg.relayRttMs;
         me.natMapping = msg.natMapping;
+        me.protocolVersion =
+          typeof msg.protocolVersion === "number" ? msg.protocolVersion : undefined;
 
         if (session.source.confirmMacHex && session.target.confirmMacHex) {
           const sameHostMatch =
@@ -791,6 +796,7 @@ export class CoordinatorEngine {
             sameHostMatch,
             peerCandidates: session.target.candidates,
             peerNatMapping: session.target.natMapping,
+            peerProtocolVersion: session.target.protocolVersion,
             selectedEdgeRelay: relayChoice?.sourceAlloc,
           });
           this.sendToPeer(session.target, {
@@ -799,17 +805,50 @@ export class CoordinatorEngine {
             sameHostMatch,
             peerCandidates: session.source.candidates,
             peerNatMapping: session.source.natMapping,
+            peerProtocolVersion: session.source.protocolVersion,
             selectedEdgeRelay: relayChoice?.targetAlloc,
           });
         }
         break;
       }
 
-      case "target_have_blobs": {
-        if (callerRole !== "target") return;
-        this.sendToPeer(session.source, {
-          type: "target_have_blobs",
-          knownBlobHashes: msg.knownBlobHashes,
+      case "control_stream_chunk": {
+        // Sealed end to end: forwarded as-is, only from the peer that owns the stream and only
+        // after both peers have exchanged their key confirmations
+        if (
+          !session.source.confirmMacHex ||
+          !session.target.confirmMacHex ||
+          !isControlStreamName(msg.stream) ||
+          callerRole !== CONTROL_STREAM_WRITER_ROLE[msg.stream] ||
+          !Number.isSafeInteger(msg.index) ||
+          typeof msg.payloadBase64 !== "string"
+        ) {
+          return;
+        }
+        this.sendToPeer(callerRole === "source" ? session.target : session.source, {
+          type: "control_stream_chunk",
+          stream: msg.stream,
+          index: msg.index,
+          final: msg.final === true,
+          payloadBase64: msg.payloadBase64,
+        });
+        break;
+      }
+
+      case "control_stream_ack": {
+        if (
+          !session.source.confirmMacHex ||
+          !session.target.confirmMacHex ||
+          !isControlStreamName(msg.stream) ||
+          callerRole === CONTROL_STREAM_WRITER_ROLE[msg.stream] ||
+          !Number.isSafeInteger(msg.index)
+        ) {
+          return;
+        }
+        this.sendToPeer(callerRole === "source" ? session.target : session.source, {
+          type: "control_stream_ack",
+          stream: msg.stream,
+          index: msg.index,
         });
         break;
       }
@@ -820,7 +859,7 @@ export class CoordinatorEngine {
         session.state = "streaming";
         this.sendToPeer(session.target, {
           type: "source_transfer_plan",
-          manifest: msg.manifest,
+          manifestEntryCount: msg.manifestEntryCount,
           rootTreeDigest: msg.rootTreeDigest,
           missingBlobCount: msg.missingBlobCount,
           missingBytesEstimate: msg.missingBytesEstimate,
@@ -828,7 +867,6 @@ export class CoordinatorEngine {
           selectedEdgeRelayRegion: msg.selectedEdgeRelayRegion,
           directUpgradePending: msg.directUpgradePending,
           directChannel: msg.directChannel,
-          ignoreSpec: msg.ignoreSpec,
         });
         break;
       }
