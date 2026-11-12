@@ -22,6 +22,7 @@ import {
   type EndpointCandidate,
   type FastCdcOptions,
   type JoinPairingResponse,
+  type NatMappingBehavior,
   type PackBlobInput,
   type ServerToClientWsMessage,
   type SessionKeyMaterial,
@@ -35,11 +36,13 @@ import {
   type EdgeRelayBinaryChannel,
 } from "./edgeRelayChannel.js";
 import {
-  connectToCandidate,
   createTargetDirectListeners,
+  discoverDirectIpAddresses,
   finishSocketStream,
+  raceCandidatesHappyEyeballs,
   receivePacksFromSocket,
   sendPackOverSocket,
+  type DiscoveredDirectAddress,
   type FramedSocketChannel,
 } from "./framedStream.js";
 import { buildSessionHostFingerprint } from "./hostIdentity.js";
@@ -66,6 +69,7 @@ export interface TransferCommonOptions {
   disableEdgeRelay?: boolean;
   preferEdgeRelay?: boolean;
   edgeRelayMaxBytes?: number;
+  maxBandwidthMbps?: number;
   allowLoopbackUdpForTest?: boolean;
   forceTier?: TransportTier;
   targetPackBytes?: number;
@@ -131,8 +135,37 @@ export interface ReceiveTransferSummary {
 
 const DEFAULT_TARGET_PACK_BYTES = 8 * 1024 * 1024; // 8 MiB
 const DEFAULT_STREAM_RELAY_THRESHOLD_BYTES = 8 * 1024 * 1024; // 8 MiB
-const DEFAULT_EDGE_RELAY_MAX_BYTES = 512 * 1024 * 1024; // 512 MiB default DERP cut-through cap before R2_PIPELINE
+const DEFAULT_EDGE_RELAY_MAX_BYTES = 512 * 1024 * 1024; // 512 MiB default Edge Relay cut-through cap before R2_PIPELINE
 const RELAY_FRAME_SLICE_BYTES = 256 * 1024; // 256 KiB per WS frame
+
+function createBandwidthPacer(
+  maxBandwidthMbps?: number,
+): ((byteCount: number) => Promise<void>) | undefined {
+  if (
+    typeof maxBandwidthMbps !== "number" ||
+    !Number.isFinite(maxBandwidthMbps) ||
+    maxBandwidthMbps <= 0
+  ) {
+    return undefined;
+  }
+  // Convert Mbps (megabits/sec) -> bytes/ms
+  const bytesPerMs = (maxBandwidthMbps * 1_000_000) / 8 / 1000;
+  let nextAllowedTimeMs = performance.now();
+
+  return async (byteCount: number) => {
+    if (byteCount <= 0) return;
+    const now = performance.now();
+    // Allow up to 50ms of idle credit accumulation so small frames do not stall
+    const floorTime = now - 50;
+    const startSlot = Math.max(nextAllowedTimeMs, floorTime);
+    const durationMs = byteCount / bytesPerMs;
+    nextAllowedTimeMs = startSlot + durationMs;
+    const waitMs = nextAllowedTimeMs - now;
+    if (waitMs >= 2) {
+      await new Promise((r) => setTimeout(r, Math.ceil(waitMs)));
+    }
+  };
+}
 
 export async function sendDirectory(
   options: SendDirectoryOptions,
@@ -285,12 +318,16 @@ class SignalingClient {
   private readonly listeners = new Set<(msg: ServerToClientWsMessage) => void>();
   private readonly buffered: ServerToClientWsMessage[] = [];
   private closedError: Error | null = null;
+  private readonly keepaliveTimer: ReturnType<typeof setInterval>;
 
   private constructor(ws: WebSocket) {
     this.ws = ws;
     ws.on("message", (raw) => {
       const str = typeof raw === "string" ? raw : raw.toString("utf8");
       const parsed = JSON.parse(str) as ServerToClientWsMessage;
+      if (parsed.type === "pong") {
+        return;
+      }
       if (this.listeners.size === 0) {
         this.buffered.push(parsed);
       } else {
@@ -300,26 +337,40 @@ class SignalingClient {
       }
     });
     ws.on("close", (_code, reason) => {
+      clearInterval(this.keepaliveTimer);
       this.closedError = new Error(
         `Signaling WebSocket closed: ${reason.toString() || "closed"}`,
       );
     });
     ws.on("error", (err) => {
+      clearInterval(this.keepaliveTimer);
       this.closedError = err;
     });
+
+    // Periodic 20s keepalive prevents NAT gateways / reverse proxies (60-100s idle timeout)
+    // from dropping the signaling socket during multi-minute bulk transfers.
+    this.keepaliveTimer = setInterval(() => {
+      if (this.ws.readyState === WebSocket.OPEN) {
+        this.send({ type: "ping", ts: Date.now() });
+      }
+    }, 20_000);
+    this.keepaliveTimer.unref();
   }
 
   static async connect(wsUrl: string): Promise<SignalingClient> {
     const ws = new WebSocket(wsUrl);
+    const client = new SignalingClient(ws);
     await new Promise<void>((resolve, reject) => {
       ws.once("open", () => resolve());
       ws.once("error", reject);
     });
-    return new SignalingClient(ws);
+    return client;
   }
 
   send(msg: ClientToServerWsMessage): void {
-    this.ws.send(JSON.stringify(msg));
+    if (this.ws.readyState === WebSocket.OPEN) {
+      this.ws.send(JSON.stringify(msg));
+    }
   }
 
   subscribe(fn: (msg: ServerToClientWsMessage) => void): () => void {
@@ -362,6 +413,7 @@ class SignalingClient {
   }
 
   close(): void {
+    clearInterval(this.keepaliveTimer);
     this.ws.close();
   }
 }
@@ -384,9 +436,16 @@ async function runSourceSession(params: {
   let directSock: FramedSocketChannel | null = null;
   let udpChan: UdpHolePunchChannel | null = null;
   let edgeChan: EdgeRelayBinaryChannel | null = null;
+  const paceBytes = createBandwidthPacer(options.maxBandwidthMbps);
+  const allStunServers = [
+    ...stunServers,
+    ...(edgeRelays ?? [])
+      .map((r) => r.stunUrl)
+      .filter((u): u is string => Boolean(u)),
+  ];
 
   try {
-    // Start scanning source workspace and probing DERP Edge Relay RTTs immediately in parallel
+    // Start scanning source workspace and probing Edge Relay RTTs immediately in parallel
     const sourceScanPromise = scanWorkspace(options.sourceDir, {
       cacheDir: options.cacheDir,
       extraIgnoreRules: options.extraIgnoreRules,
@@ -453,7 +512,7 @@ async function runSourceSession(params: {
 
     if (enableUdp) {
       udpPrep = await prepareUdpPunchEndpoint(
-        stunServers,
+        allStunServers,
         Boolean(options.allowLoopbackUdpForTest),
       );
     }
@@ -468,6 +527,7 @@ async function runSourceSession(params: {
       hostFingerprint,
       candidates: udpPrep ? udpPrep.candidates : [],
       relayRttMs,
+      natMapping: udpPrep?.natMapping,
     });
 
     const peerConfirmed = await peerConfirmedPromise;
@@ -579,9 +639,17 @@ async function runSourceSession(params: {
             selectedTier = "P2P_DIRECT";
           }
         }
+        // Skip futile 1.5s UDP hole-punch delay when BOTH peers are behind unpredicted
+        // Symmetric NAT and an Edge Relay or R2 fallback is available.
+        const bothUnpredictedSymmetricNat =
+          udpPrep?.natMapping === "symmetric" &&
+          !udpPrep.hasSequentialPrediction &&
+          peerConfirmed.peerNatMapping === "symmetric";
+
         if (
           !directSock &&
           udpPrep &&
+          !bothUnpredictedSymmetricNat &&
           peerConfirmed.peerCandidates.some((c) => c.kind === "udp_punch")
         ) {
           try {
@@ -599,7 +667,7 @@ async function runSourceSession(params: {
         }
       }
 
-      // 3. DERP-style EDGE_RELAY (multi-region binary cut-through WSS / IP+TLS)
+      // 3. EDGE_RELAY (multi-region binary cut-through WSS / IP+TLS)
       //    vs 4. Micro-delta STREAM_RELAY vs 5. Bulk CAS R2_PIPELINE
       if (!directSock && !udpChan) {
         if (
@@ -684,6 +752,7 @@ async function runSourceSession(params: {
         });
 
         try {
+          await paceBytes?.(pack.wireBytes.length);
           if (directSock) {
             await sendPackOverSocket(directSock, pack.packId, pack.wireBytes);
           } else if (udpChan) {
@@ -724,6 +793,7 @@ async function runSourceSession(params: {
           convergent: convergentPacks,
           sig,
           concurrency: options.uploadConcurrency ?? 8,
+          paceBytes,
         });
         requiredPackIds.push(...r2Stats.packIds);
         wireBytesSent += r2Stats.wireBytesUploaded;
@@ -748,6 +818,7 @@ async function runSourceSession(params: {
           channel: edgeChan,
           totalBatches: batches.length,
           simulateDropAfterPacks: options.simulateEdgeRelayDropAfterPacks,
+          paceBytes,
           producePackAt: async (idx) => {
             const blobs = await readBlobBatch(batches[idx], sourceScan.blobSlices);
             return encodePack(blobs, {
@@ -803,6 +874,7 @@ async function runSourceSession(params: {
           convergent: convergentPacks,
           sig,
           concurrency: options.uploadConcurrency ?? 8,
+          paceBytes,
         });
         requiredPackIds.push(...r2Stats.packIds);
         wireBytesSent += r2Stats.wireBytesUploaded;
@@ -829,6 +901,7 @@ async function runSourceSession(params: {
             seq * RELAY_FRAME_SLICE_BYTES,
             Math.min(pack.wireBytes.length, (seq + 1) * RELAY_FRAME_SLICE_BYTES),
           );
+          await paceBytes?.(slice.byteLength);
           sig.send({
             type: "relay_pack_frame",
             packId: pack.packId,
@@ -847,6 +920,7 @@ async function runSourceSession(params: {
         convergent: convergentPacks,
         sig,
         concurrency: options.uploadConcurrency ?? 8,
+        paceBytes,
       });
       requiredPackIds.push(...r2Stats.packIds);
       wireBytesSent += r2Stats.wireBytesUploaded;
@@ -913,9 +987,15 @@ async function runTargetSession(params: {
   let udpChan = null as UdpHolePunchChannel | null;
   let edgeChan = null as EdgeRelayBinaryChannel | null;
   let materializer: AtomicWorkspaceMaterializer | null = null;
+  const allStunServers = [
+    ...stunServers,
+    ...(edgeRelays ?? [])
+      .map((r) => r.stunUrl)
+      .filter((u): u is string => Boolean(u)),
+  ];
 
   try {
-    // Scan existing target directory and probe DERP Edge Relay RTTs in parallel
+    // Scan existing target directory and probe Edge Relay RTTs in parallel
     const existingTargetScanPromise = scanWorkspace(options.targetDir, {
       cacheDir: options.cacheDir,
       smallFileThresholdBytes: options.smallFileThresholdBytes,
@@ -994,7 +1074,7 @@ async function runTargetSession(params: {
 
     if (enableUdp) {
       udpPrep = await prepareUdpPunchEndpoint(
-        stunServers,
+        allStunServers,
         Boolean(options.allowLoopbackUdpForTest),
       );
     }
@@ -1010,6 +1090,7 @@ async function runTargetSession(params: {
         ...(udpPrep ? udpPrep.candidates : []),
       ],
       relayRttMs,
+      natMapping: udpPrep?.natMapping,
     });
 
     const peerConfirmed = await peerConfirmedPromise;
@@ -1402,6 +1483,7 @@ async function uploadPackBatchesToR2(params: {
   convergent?: boolean;
   sig: SignalingClient;
   concurrency: number;
+  paceBytes?: (byteCount: number) => Promise<void>;
 }): Promise<{
   packIds: string[];
   wireBytesUploaded: number;
@@ -1473,6 +1555,7 @@ async function uploadPackBatchesToR2(params: {
             continue;
           }
 
+          await params.paceBytes?.(pack.wireBytes.length);
           await putBytesWithRetry(slot.putUrl, pack.wireBytes);
           wireBytesUploaded += pack.wireBytes.length;
 
@@ -1498,14 +1581,10 @@ async function tryConnectCandidates(
   transportKey: Uint8Array,
   sessionId: string,
 ): Promise<FramedSocketChannel | null> {
-  for (const cand of candidates) {
-    try {
-      return await connectToCandidate(cand, transportKey, sessionId, 800);
-    } catch {
-      // Try next candidate
-    }
-  }
-  return null;
+  return raceCandidatesHappyEyeballs(candidates, transportKey, sessionId, {
+    staggerMs: 100,
+    perAttemptTimeoutMs: 900,
+  });
 }
 
 async function putBytesWithRetry(
@@ -1609,6 +1688,9 @@ function waitForFallbackTrigger(
 export async function runDoctor(serverUrl: string): Promise<{
   serverHealth: Record<string, unknown>;
   stunReflexiveEndpoint: { ip: string; port: number } | null;
+  natMapping: NatMappingBehavior;
+  natPortStride: number;
+  directInterfaces: DiscoveredDirectAddress[];
   edgeRelayRttMs: Record<string, number>;
   zstdSelfTestOk: boolean;
 }> {
@@ -1624,9 +1706,15 @@ export async function runDoctor(serverUrl: string): Promise<{
   const edgeRelays = Array.isArray(serverHealth.edgeRelays)
     ? (serverHealth.edgeRelays as EdgeRelayNodeInfo[])
     : [];
+  const allStunServers = [
+    ...stunServers,
+    ...edgeRelays
+      .map((r) => r.stunUrl)
+      .filter((u): u is string => Boolean(u)),
+  ];
 
   const [prep, edgeRelayRttMs] = await Promise.all([
-    prepareUdpPunchEndpoint(stunServers),
+    prepareUdpPunchEndpoint(allStunServers),
     probeEdgeRelayRtts(edgeRelays, 1500),
   ]);
   const udpCand = prep.candidates.find((c) => c.kind === "udp_punch");
@@ -1643,6 +1731,9 @@ export async function runDoctor(serverUrl: string): Promise<{
     stunReflexiveEndpoint: udpCand
       ? { ip: udpCand.address, port: udpCand.port! }
       : null,
+    natMapping: prep.natMapping,
+    natPortStride: prep.portStride,
+    directInterfaces: discoverDirectIpAddresses(),
     edgeRelayRttMs,
     zstdSelfTestOk,
   };

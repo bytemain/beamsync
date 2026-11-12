@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# One-step systemd installer for a stateless DERP-style Edge Relay + UDP STUN node
+# One-step systemd installer for a stateless BeamSync Edge Relay + UDP STUN node
 # Ideal for Shanghai / domestic cloud VMs using raw IP + self-signed TLS (zero domain, zero ICP filing)
 INSTALL_DIR="${INSTALL_DIR:-/opt/beamsync-edge-relay}"
 TLS_DIR="${TLS_DIR:-/var/lib/beamsync-edge-relay}"
@@ -30,7 +30,7 @@ fi
 
 cat >/etc/systemd/system/beamsync-edge-relay.service <<EOF
 [Unit]
-Description=BeamSync Stateless DERP Edge Relay & UDP STUN Node
+Description=BeamSync Stateless Edge Relay & UDP STUN Node
 After=network-online.target
 Wants=network-online.target
 
@@ -38,7 +38,7 @@ Wants=network-online.target
 Type=simple
 WorkingDirectory=$INSTALL_DIR
 EnvironmentFile=$ENV_FILE
-Environment=TLS_CACHE_FILE=$TLS_DIR/derp-tls.json
+Environment=TLS_CACHE_FILE=$TLS_DIR/edge-relay-tls.json
 ExecStart=/usr/bin/env node $INSTALL_DIR/packages/edge-relay/dist/bin.js
 Restart=always
 RestartSec=2

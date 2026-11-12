@@ -22,7 +22,7 @@ const FRAME_STREAM_END = 0x1f;
 const WS_SEND_HIGH_WATERMARK = 8 * 1024 * 1024;
 
 /**
- * Builds an `https.Agent` implementing Tailscale-DERP-style certificate SHA-256
+ * Builds an `https.Agent` implementing raw X.509 certificate SHA-256
  * pinning (`certSha256`) and SNI suppression (`noSni: true`, `servername: ""`).
  * Enables zero-domain, ICP-free raw IP + TLS Edge Relay nodes (e.g. Shanghai VMs)
  * while strictly rejecting any MITM certificate that does not match `certSha256`.
@@ -138,7 +138,7 @@ async function httpProbeOnce(
 }
 
 /**
- * Probes all candidate DERP-style Edge Relay nodes in parallel via HTTP/HTTPS `/probe`
+ * Probes all candidate Edge Relay nodes in parallel via HTTP/HTTPS `/probe`
  * (honoring pinned self-signed `certSha256` and `noSni` for IP-only relays)
  * and returns `relayId -> RTT (ms)` for reachable nodes.
  */
@@ -339,7 +339,7 @@ export class EdgeRelayBinaryChannel {
 }
 
 /**
- * Connects to a DERP-style Edge Relay WebSocket room using a Coordinator-minted ticket,
+ * Connects to a regional Edge Relay WebSocket room using a Coordinator-minted ticket,
  * validates optional SHA-256 certificate pin (`certSha256`) + SNI-free mode (`noSni`),
  * waits for peer attachment (`0x01`), and performs an end-to-end mutual HMAC handshake
  * with `transportKey` so the zero-knowledge relay cannot MITM or spoof either peer.
@@ -396,7 +396,7 @@ export async function connectEdgeRelayBinaryChannel(params: {
       const sourceNonce = randomBytes(32);
       const sourceMac = hmacSha256(
         params.transportKey,
-        concatBytes(utf8Bytes(`derp-source-init:${params.sessionId}:`), sourceNonce),
+        concatBytes(utf8Bytes(`edge-source-init:${params.sessionId}:`), sourceNonce),
       );
       await channel.sendFrame(FRAME_AUTH_INIT, concatBytes(sourceNonce, sourceMac));
 
@@ -409,7 +409,7 @@ export async function connectEdgeRelayBinaryChannel(params: {
       const expectedTargetMac = hmacSha256(
         params.transportKey,
         concatBytes(
-          utf8Bytes(`derp-target-reply:${params.sessionId}:`),
+          utf8Bytes(`edge-target-reply:${params.sessionId}:`),
           sourceNonce,
           targetNonce,
         ),
@@ -426,7 +426,7 @@ export async function connectEdgeRelayBinaryChannel(params: {
       const sourceMac = init.body.subarray(32, 64);
       const expectedSourceMac = hmacSha256(
         params.transportKey,
-        concatBytes(utf8Bytes(`derp-source-init:${params.sessionId}:`), sourceNonce),
+        concatBytes(utf8Bytes(`edge-source-init:${params.sessionId}:`), sourceNonce),
       );
       if (!constantTimeEqual(sourceMac, expectedSourceMac)) {
         throw new Error("Mutual Edge Relay peer authentication failed on target");
@@ -436,7 +436,7 @@ export async function connectEdgeRelayBinaryChannel(params: {
       const targetMac = hmacSha256(
         params.transportKey,
         concatBytes(
-          utf8Bytes(`derp-target-reply:${params.sessionId}:`),
+          utf8Bytes(`edge-target-reply:${params.sessionId}:`),
           sourceNonce,
           targetNonce,
         ),
@@ -452,7 +452,7 @@ export async function connectEdgeRelayBinaryChannel(params: {
 }
 
 /**
- * Streams encrypted packs over an established DERP Edge Relay channel using a
+ * Streams encrypted packs over an established Edge Relay channel using a
  * sliding window of up to `maxInFlight` concurrent packs so high-latency WAN links
  * stay saturated without stalling on per-pack RTT.
  */
@@ -461,6 +461,7 @@ export async function streamPackBatchesOverEdgeRelay(params: {
   totalBatches: number;
   maxInFlight?: number;
   simulateDropAfterPacks?: number;
+  paceBytes?: (byteCount: number) => Promise<void>;
   producePackAt: (batchIndex: number) => Promise<{ packId: string; wireBytes: Uint8Array }>;
 }): Promise<{
   allPackIds: Array<string | undefined>;
@@ -533,6 +534,7 @@ export async function streamPackBatchesOverEdgeRelay(params: {
     const idBytes = utf8Bytes(pack.packId);
     const idLen = new Uint8Array([idBytes.length]);
     try {
+      await params.paceBytes?.(pack.wireBytes.length);
       await params.channel.sendFrame(
         FRAME_PACK_DATA,
         concatBytes(idLen, idBytes, pack.wireBytes),

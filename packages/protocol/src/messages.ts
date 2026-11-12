@@ -79,6 +79,11 @@ export interface AllocatedUploadSlot {
   alreadyExistsInCas: boolean;
 }
 
+export type NatMappingBehavior =
+  | "unknown"
+  | "endpoint_independent"
+  | "symmetric";
+
 export type ClientToServerWsMessage =
   | {
       type: "hello";
@@ -92,6 +97,7 @@ export type ClientToServerWsMessage =
       hostFingerprint: string;
       candidates: EndpointCandidate[];
       relayRttMs?: Record<string, number>;
+      natMapping?: NatMappingBehavior;
     }
   | {
       type: "target_have_blobs";
@@ -167,6 +173,7 @@ export type ServerToClientWsMessage =
       peerConfirmMacHex: string;
       sameHostMatch: boolean;
       peerCandidates: EndpointCandidate[];
+      peerNatMapping?: NatMappingBehavior;
       selectedEdgeRelay?: SignedEdgeRelayAllocation;
     }
   | {

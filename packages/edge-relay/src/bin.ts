@@ -18,7 +18,7 @@ async function main(): Promise<void> {
   const tlsCertFile = process.env.TLS_CERT_FILE?.trim() || undefined;
   const tlsKeyFile = process.env.TLS_KEY_FILE?.trim() || undefined;
   const tlsCacheFile =
-    process.env.TLS_CACHE_FILE?.trim() || "/tmp/beamsync-derp-tls.json";
+    process.env.TLS_CACHE_FILE?.trim() || "/tmp/beamsync-edge-relay-tls.json";
 
   // Default to self-signed IP+TLS whenever PUBLIC_IP is provided without PUBLIC_RELAY_URL
   // (e.g. ICP-free Shanghai / domestic cloud VM mode), or when TLS_MODE=self-signed

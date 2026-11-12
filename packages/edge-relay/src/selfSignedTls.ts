@@ -71,7 +71,7 @@ export interface SelfSignedTlsMaterial {
 
 /**
  * Generates (or loads from disk) a pure Node `node:crypto` X.509v3 ECDSA P-256
- * self-signed TLS certificate for IP-only / domainless DERP Edge Relay deployments
+ * self-signed TLS certificate for IP-only / domainless Edge Relay deployments
  * (e.g. Shanghai / domestic cloud VMs without ICP domain filing).
  * Requires zero external `openssl` CLI binary or CA infrastructure.
  */
@@ -115,7 +115,7 @@ export async function getOrCreateSelfSignedTlsMaterial(options?: {
   ]);
 
   // Subject / Issuer CN (OID 2.5.4.3 -> 55 04 03)
-  const cn = options?.commonName ?? "beamsync-derp-ip-node";
+  const cn = options?.commonName ?? "beamsync-edge-relay-node";
   const rdnCn = derSet([
     derSequence([derOid([0x55, 0x04, 0x03]), derUtf8String(cn)]),
   ]);

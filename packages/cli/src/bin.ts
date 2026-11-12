@@ -30,7 +30,7 @@ function printUsage(): void {
   console.log(`BeamSync CLI — streaming incremental directory sync & migration
 
 Usage:
-  beamsync send <source-dir> [--server <url>] [--scope <namespace>] [--code <words>] [--prefer-edge-relay] [--disable-edge-relay] [--force-tier <tier>]
+  beamsync send <source-dir> [--server <url>] [--scope <namespace>] [--code <words>] [--prefer-edge-relay] [--disable-edge-relay] [--max-mbps <mbps>] [--force-tier <tier>]
   beamsync receive <target-dir> --code <pairing-code> [--server <url>] [--disable-edge-relay]
   beamsync doctor [--server <url>]
 
@@ -65,6 +65,10 @@ async function main(): Promise<void> {
       typeof flags.scope === "string" ? flags.scope : undefined;
     const customWords =
       typeof flags.code === "string" ? flags.code : undefined;
+    const maxBandwidthMbps =
+      typeof flags["max-mbps"] === "string"
+        ? Number.parseFloat(flags["max-mbps"])
+        : undefined;
 
     const result = await sendDirectory({
       serverUrl,
@@ -73,6 +77,7 @@ async function main(): Promise<void> {
       customSecretWords: customWords,
       preferEdgeRelay: Boolean(flags["prefer-edge-relay"]),
       disableEdgeRelay: Boolean(flags["disable-edge-relay"]),
+      maxBandwidthMbps,
       forceTier,
       onPairingCode: (code) => {
         console.log(`\nPairing ready. Run on target machine:\n`);

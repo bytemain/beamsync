@@ -22,7 +22,7 @@ WORKDIR /app
 ENV NODE_ENV=production
 ENV PORT=8443
 ENV STUN_PORT=3478
-ENV TLS_CACHE_FILE=/tls/derp-tls.json
+ENV TLS_CACHE_FILE=/tls/edge-relay-tls.json
 
 COPY --from=builder /app/package.json /app/package-lock.json ./
 COPY --from=builder /app/packages/protocol/package.json ./packages/protocol/

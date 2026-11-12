@@ -41,7 +41,7 @@ export interface EdgeRelayServerConfig {
   port?: number;
   host?: string;
   /**
-   * Public URL (e.g. `https://sgp-derp.example.com` or `https://101.132.x.x:8443`).
+   * Public URL (e.g. `https://sgp-relay.example.com` or `https://101.132.x.x:8443`).
    * If omitted and `publicIp` is provided with `tlsMode: "self-signed"`, automatically
    * builds `https://<publicIp>:<port>` for domainless/ICP-free deployment.
    */
@@ -137,10 +137,10 @@ async function startEmbeddedStun(
 }
 
 /**
- * Starts a stateless DERP-style Edge Relay & STUN server (`@beamsync/edge-relay`).
- * Supports both domain HTTPS/WSS behind reverse proxies AND Tailscale-DERP-style
- * raw IP + self-signed TLS with SHA-256 certificate pinning and SNI suppression
- * (for domestic / Shanghai cloud VMs with zero domain and zero ICP filing).
+ * Starts a stateless regional Edge Relay & UDP STUN server (`@beamsync/edge-relay`).
+ * Supports both domain HTTPS/WSS behind reverse proxies AND raw IP + self-signed TLS
+ * with SHA-256 certificate pinning and SNI suppression (for domestic / Shanghai cloud VMs
+ * with zero domain and zero ICP filing).
  */
 export async function startEdgeRelayServer(
   config: EdgeRelayServerConfig,
@@ -167,7 +167,7 @@ export async function startEdgeRelayServer(
 
   if (tlsMode === "self-signed") {
     const generated = await getOrCreateSelfSignedTlsMaterial({
-      commonName: `beamsync-derp-${config.region}`,
+      commonName: `beamsync-relay-${config.region}`,
       ipSan: config.publicIp,
       cacheFilePath: config.tlsCacheFile,
     });
@@ -429,6 +429,18 @@ export async function startEdgeRelayServer(
     noSni: effectiveNoSni || undefined,
   };
 
+  const wsPingTimer = setInterval(() => {
+    for (const room of rooms.values()) {
+      if (room.source?.readyState === WebSocket.OPEN) {
+        room.source.ping();
+      }
+      if (room.target?.readyState === WebSocket.OPEN) {
+        room.target.ping();
+      }
+    }
+  }, 20_000);
+  wsPingTimer.unref();
+
   let hbTimer: ReturnType<typeof setInterval> | null = null;
   const sendHeartbeat = async () => {
     if (!config.coordinatorUrl) return;
@@ -496,6 +508,7 @@ export async function startEdgeRelayServer(
       rooms.clear();
     },
     close: async () => {
+      clearInterval(wsPingTimer);
       if (hbTimer) clearInterval(hbTimer);
       for (const room of rooms.values()) {
         room.source?.terminate();

@@ -11,6 +11,7 @@ import {
   type EdgeRelayNodeInfo,
   type EndpointCandidate,
   type JoinPairingResponse,
+  type NatMappingBehavior,
   type PackReceiptRow,
   type ServerToClientWsMessage,
   type SessionMode,
@@ -51,6 +52,7 @@ interface PeerRuntimeState {
   hostFingerprint?: string;
   candidates: EndpointCandidate[];
   relayRttMs?: Record<string, number>;
+  natMapping?: NatMappingBehavior;
 }
 
 export interface SessionRuntimeRecord {
@@ -114,7 +116,7 @@ export class CoordinatorEngine {
   private readonly pairingSlots = new Map<string, string>(); // slotCode -> sessionId
   private readonly casPacks = new Map<string, CasPackRecord>(); // `${scope}:${packId}`
   private readonly scopeCasKeys = new Map<string, string>(); // scopeNamespace -> 32B hex
-  private readonly edgeRelays = new Map<string, RegisteredEdgeRelay>(); // relayId -> DERP-like node
+  private readonly edgeRelays = new Map<string, RegisteredEdgeRelay>(); // relayId -> regional Edge Relay node
 
   constructor(options: CoordinatorEngineOptions) {
     this.storageDriver = options.storageDriver;
@@ -211,7 +213,7 @@ export class CoordinatorEngine {
     const relays = this.listActiveEdgeRelays();
     if (relays.length === 0) return null;
 
-    // DERP-style minimum joint RTT selection: argmin_r (RTT_source(r) + RTT_target(r))
+    // Minimum joint RTT selection across RelayMap: argmin_r (RTT_source(r) + RTT_target(r))
     let chosen = relays[0];
     let bestScore = Number.POSITIVE_INFINITY;
     for (const r of relays) {
@@ -585,6 +587,7 @@ export class CoordinatorEngine {
         me.hostFingerprint = msg.hostFingerprint;
         me.candidates = msg.candidates;
         me.relayRttMs = msg.relayRttMs;
+        me.natMapping = msg.natMapping;
 
         if (session.source.confirmMacHex && session.target.confirmMacHex) {
           const sameHostMatch =
@@ -603,6 +606,7 @@ export class CoordinatorEngine {
             peerConfirmMacHex: session.target.confirmMacHex,
             sameHostMatch,
             peerCandidates: session.target.candidates,
+            peerNatMapping: session.target.natMapping,
             selectedEdgeRelay: relayChoice?.sourceAlloc,
           });
           this.sendToPeer(session.target, {
@@ -610,6 +614,7 @@ export class CoordinatorEngine {
             peerConfirmMacHex: session.source.confirmMacHex,
             sameHostMatch,
             peerCandidates: session.source.candidates,
+            peerNatMapping: session.source.natMapping,
             selectedEdgeRelay: relayChoice?.targetAlloc,
           });
         }

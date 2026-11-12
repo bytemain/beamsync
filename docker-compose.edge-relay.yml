@@ -17,9 +17,9 @@ services:
       STUN_PORT: "3478"
       COORDINATOR_URL: "${COORDINATOR_URL:-}"
       RELAY_AUTH_SECRET: "${RELAY_AUTH_SECRET}"
-      TLS_CACHE_FILE: "/tls/derp-tls.json"
+      TLS_CACHE_FILE: "/tls/edge-relay-tls.json"
     volumes:
-      - beamsync_derp_tls:/tls
+      - beamsync_edge_relay_tls:/tls
 
 volumes:
-  beamsync_derp_tls:
+  beamsync_edge_relay_tls:

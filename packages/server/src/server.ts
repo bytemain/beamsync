@@ -363,6 +363,15 @@ export async function startBeamSyncServer(
   }, 60_000);
   gcTimer.unref();
 
+  const wsPingTimer = setInterval(() => {
+    for (const ws of wss.clients) {
+      if (ws.readyState === ws.OPEN) {
+        ws.ping();
+      }
+    }
+  }, 20_000);
+  wsPingTimer.unref();
+
   return {
     httpUrl: resolvedPublicHttp,
     wsBaseUrl: resolvedWsBase,
@@ -372,6 +381,7 @@ export async function startBeamSyncServer(
     coordinator,
     close: async () => {
       clearInterval(gcTimer);
+      clearInterval(wsPingTimer);
       for (const client of wss.clients) {
         client.terminate();
       }

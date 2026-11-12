@@ -5,9 +5,10 @@ import {
   concatBytes,
   utf8Bytes,
   type EndpointCandidate,
+  type NatMappingBehavior,
 } from "@beamsync/protocol";
 import { listLanIpv4Addresses } from "./framedStream.js";
-import { queryStunReflexiveAddress } from "./stunClient.js";
+import { classifyNatMappingBehavior } from "./stunClient.js";
 
 const UDP_MAGIC = new Uint8Array([0x42, 0x4d, 0x55, 0x31]); // "BMU1"
 const PKT_PUNCH_HELLO = 0x01;
@@ -20,11 +21,16 @@ const PKT_STREAM_FIN = 0x1f;
 const PKT_STREAM_FIN_ACK = 0x20;
 
 const CHUNK_PAYLOAD_BYTES = 1150; // Safe below standard 1280/1500 UDP MTU
-const WINDOW_SIZE = 32;
+const INITIAL_CWND_CHUNKS = 64;
+const MIN_CWND_CHUNKS = 32;
+const MAX_CWND_CHUNKS = 256; // ~294 KiB max in-flight window per pack stream
 
 export interface PreparedUdpPunchEndpoint {
   socket: dgram.Socket;
   candidates: EndpointCandidate[];
+  natMapping: NatMappingBehavior;
+  portStride: number;
+  hasSequentialPrediction: boolean;
   close(): Promise<void>;
 }
 
@@ -47,18 +53,38 @@ export async function prepareUdpPunchEndpoint(
   const seen = new Set<string>();
 
   const addCandidate = (ip: string, port: number) => {
+    if (port <= 0 || port > 65535) return;
     const key = `${ip}:${port}`;
     if (seen.has(key)) return;
     seen.add(key);
     candidates.push({ kind: "udp_punch", address: ip, port });
   };
 
-  // Query STUN servers on the exact same bound UDP socket to preserve NAT port mapping
-  for (const stunUrl of stunServers.slice(0, 2)) {
-    const reflexive = await queryStunReflexiveAddress(socket, stunUrl, 600);
-    if (reflexive) {
-      addCandidate(reflexive.ip, reflexive.port);
-      break;
+  // Query up to 2 STUN servers on the exact same bound UDP socket to preserve NAT port mapping
+  // AND classify Endpoint-Independent (Cone) vs Symmetric NAT + sequential port stride.
+  const natInfo = await classifyNatMappingBehavior(socket, stunServers, 600);
+  for (const ep of natInfo.endpoints) {
+    if (ep.family === 4) {
+      addCandidate(ep.ip, ep.port);
+    }
+  }
+
+  let hasSequentialPrediction = false;
+  if (
+    natInfo.natMapping === "symmetric" &&
+    natInfo.endpoints.length >= 2 &&
+    Math.abs(natInfo.portStride) >= 1 &&
+    Math.abs(natInfo.portStride) <= 8
+  ) {
+    const latest = natInfo.endpoints[natInfo.endpoints.length - 1];
+    if (latest.family === 4) {
+      hasSequentialPrediction = true;
+      for (let step = 1; step <= 3; step++) {
+        const predictedPort = latest.port + natInfo.portStride * step;
+        if (predictedPort >= 1024 && predictedPort <= 65535) {
+          addCandidate(latest.ip, predictedPort);
+        }
+      }
     }
   }
 
@@ -73,6 +99,9 @@ export async function prepareUdpPunchEndpoint(
   return {
     socket,
     candidates,
+    natMapping: natInfo.natMapping,
+    portStride: natInfo.portStride,
+    hasSequentialPrediction,
     close: () =>
       new Promise<void>((resolve) => {
         try {
@@ -91,6 +120,7 @@ export class UdpHolePunchChannel {
   private peerAddress: string;
   private peerPort: number;
   private closed = false;
+  private srttMs = 40;
   private readonly listeners = new Set<
     (pktType: number, body: Uint8Array, rinfo: dgram.RemoteInfo) => void
   >();
@@ -109,6 +139,15 @@ export class UdpHolePunchChannel {
     this.peerPort = params.peerPort;
 
     this.socket.on("message", this.onRawDatagram);
+  }
+
+  updateRttSample(sampleMs: number): void {
+    const clamped = Math.max(1, Math.min(2000, sampleMs));
+    this.srttMs = this.srttMs * 0.8 + clamped * 0.2;
+  }
+
+  getAdaptiveRtoMs(): number {
+    return Math.max(35, Math.min(600, Math.round(this.srttMs * 2.5)));
   }
 
   private readonly onRawDatagram = (
@@ -168,7 +207,7 @@ export class UdpHolePunchChannel {
 
 /**
  * Simultaneous bidirectional UDP hole punching across all peer `udp_punch` candidates.
- * Both endpoints fire AEAD-authenticated `PKT_PUNCH_HELLO` probes every 60ms so stateful
+ * Both endpoints fire AEAD-authenticated `PKT_PUNCH_HELLO` probes every 50ms so stateful
  * NAT firewalls open return pinholes on both sides, completing once mutual `PKT_PUNCH_ACK`
  * is confirmed.
  */
@@ -195,6 +234,7 @@ export async function establishUdpHolePunch(params: {
   });
 
   const timeoutMs = params.timeoutMs ?? 1200;
+  const punchStartedAt = performance.now();
 
   return new Promise<UdpHolePunchChannel>((resolve, reject) => {
     let gotPeerHello = false;
@@ -204,6 +244,7 @@ export async function establishUdpHolePunch(params: {
     const finishOk = () => {
       if (settled) return;
       settled = true;
+      channel.updateRttSample(performance.now() - punchStartedAt);
       clearInterval(probeInterval);
       clearTimeout(timer);
       unsub();
@@ -290,11 +331,41 @@ export async function sendPackOverUdp(
     Math.ceil(wireBytes.length / CHUNK_PAYLOAD_BYTES),
   );
   const acked = new Uint8Array(totalChunks);
+  const firstSentAt = new Float64Array(totalChunks);
+  const txCount = new Uint16Array(totalChunks);
   let ackedCount = 0;
 
   await new Promise<void>((resolve, reject) => {
     let base = 0;
     let retries = 0;
+    let cwnd = INITIAL_CWND_CHUNKS;
+    let retransmitTimer: ReturnType<typeof setTimeout> | null = null;
+
+    const markChunkAcked = (idx: number, now: number): boolean => {
+      if (idx < 0 || idx >= totalChunks || acked[idx]) return false;
+      acked[idx] = 1;
+      ackedCount++;
+      if (txCount[idx] === 1 && firstSentAt[idx] > 0) {
+        channel.updateRttSample(now - firstSentAt[idx]);
+      }
+      return true;
+    };
+
+    const scheduleRto = () => {
+      if (retransmitTimer) clearTimeout(retransmitTimer);
+      retransmitTimer = setTimeout(() => {
+        retries++;
+        if (retries > 45) {
+          unsub();
+          reject(new Error("UDP pack stream exceeded retransmission limit"));
+          return;
+        }
+        // Multiplicative decrease on loss/timeout
+        cwnd = Math.max(MIN_CWND_CHUNKS, Math.floor(cwnd / 2));
+        sendWindow(true);
+        scheduleRto();
+      }, channel.getAdaptiveRtoMs());
+    };
 
     const unsub = channel.onPacket((pktType, body) => {
       if (pktType === PKT_DATA_ACK && body.length >= 8) {
@@ -304,21 +375,49 @@ export async function sendPackOverUdp(
           body.byteLength,
         );
         const rxPackSeq = view.getUint32(0, false);
+        if (rxPackSeq !== packSeq) return;
+
+        const now = performance.now();
         const chunkIdx = view.getUint32(4, false);
-        if (rxPackSeq === packSeq && chunkIdx < totalChunks && !acked[chunkIdx]) {
-          acked[chunkIdx] = 1;
-          ackedCount++;
+        let newlyAcked = 0;
+        if (markChunkAcked(chunkIdx, now)) {
+          newlyAcked++;
+        }
+
+        // Process optional cumulative base + 64-bit SACK bitmap (20-byte ACK frame)
+        if (body.length >= 20) {
+          const peerBase = Math.min(totalChunks, view.getUint32(8, false));
+          for (let c = base; c < peerBase; c++) {
+            if (markChunkAcked(c, now)) newlyAcked++;
+          }
+          const sackHi = view.getUint32(12, false);
+          const sackLo = view.getUint32(16, false);
+          for (let bit = 0; bit < 64; bit++) {
+            const isSet =
+              bit < 32
+                ? ((sackLo >>> bit) & 1) === 1
+                : ((sackHi >>> (bit - 32)) & 1) === 1;
+            if (isSet && markChunkAcked(peerBase + bit, now)) {
+              newlyAcked++;
+            }
+          }
+        }
+
+        if (newlyAcked > 0) {
           retries = 0;
+          // Additive / slow-start increase up to MAX_CWND_CHUNKS
+          cwnd = Math.min(MAX_CWND_CHUNKS, cwnd + Math.min(4, newlyAcked));
           while (base < totalChunks && acked[base]) {
             base++;
           }
           if (ackedCount === totalChunks) {
-            clearInterval(retransmitTimer);
+            if (retransmitTimer) clearTimeout(retransmitTimer);
             unsub();
             resolve();
             return;
           }
           sendWindow(false);
+          scheduleRto();
         }
       }
     });
@@ -332,12 +431,16 @@ export async function sendPackOverUdp(
       dv.setUint32(0, packSeq, false);
       dv.setUint32(4, idx, false);
       dv.setUint32(8, totalChunks, false);
+      if (txCount[idx] === 0) {
+        firstSentAt[idx] = performance.now();
+      }
+      txCount[idx]++;
       channel.sendEncrypted(PKT_DATA_CHUNK, concatBytes(header, slice));
     };
 
     let highestSent = -1;
     const sendWindow = (retransmitUnacked: boolean) => {
-      const winEnd = Math.min(totalChunks, base + WINDOW_SIZE);
+      const winEnd = Math.min(totalChunks, base + cwnd);
       for (let i = base; i < winEnd; i++) {
         if (!acked[i] && (retransmitUnacked || i > highestSent)) {
           sendChunk(i);
@@ -347,16 +450,7 @@ export async function sendPackOverUdp(
     };
 
     sendWindow(false);
-    const retransmitTimer = setInterval(() => {
-      retries++;
-      if (retries > 40) {
-        clearInterval(retransmitTimer);
-        unsub();
-        reject(new Error("UDP pack stream exceeded retransmission limit"));
-        return;
-      }
-      sendWindow(true);
-    }, 60);
+    scheduleRto();
   });
 
   // Confirm full pack assembly on receiver
@@ -385,14 +479,14 @@ export async function sendPackOverUdp(
     channel.sendEncrypted(PKT_PACK_DONE, donePayload);
     const timer = setInterval(() => {
       attempts++;
-      if (attempts > 40) {
+      if (attempts > 45) {
         clearInterval(timer);
         unsub();
         reject(new Error("UDP PACK_DONE confirmation timed out"));
         return;
       }
       channel.sendEncrypted(PKT_PACK_DONE, donePayload);
-    }, 60);
+    }, channel.getAdaptiveRtoMs());
   });
 }
 
@@ -429,7 +523,12 @@ export async function receivePacksFromUdp(
   const decoder = new TextDecoder();
   const buffersBySeq = new Map<
     number,
-    { totalChunks: number; chunks: Array<Uint8Array | undefined>; received: number }
+    {
+      totalChunks: number;
+      chunks: Array<Uint8Array | undefined>;
+      received: number;
+      rxBase: number;
+    }
   >();
   const deliveredSeqs = new Set<number>();
 
@@ -468,18 +567,41 @@ export async function receivePacksFromUdp(
             totalChunks,
             chunks: new Array(totalChunks),
             received: 0,
+            rxBase: 0,
           };
           buffersBySeq.set(packSeq, state);
         }
         if (chunkIdx < totalChunks && !state.chunks[chunkIdx]) {
           state.chunks[chunkIdx] = slice;
           state.received++;
+          while (state.rxBase < totalChunks && state.chunks[state.rxBase]) {
+            state.rxBase++;
+          }
         }
 
-        const ackBuf = new Uint8Array(8);
+        // 20-byte cumulative + 64-bit SACK ACK frame
+        const ackBuf = new Uint8Array(20);
         const ackDv = new DataView(ackBuf.buffer);
         ackDv.setUint32(0, packSeq, false);
         ackDv.setUint32(4, chunkIdx, false);
+        const rxBase = state.rxBase;
+        ackDv.setUint32(8, rxBase, false);
+
+        let sackLo = 0;
+        let sackHi = 0;
+        for (let bit = 0; bit < 64; bit++) {
+          const targetIdx = rxBase + bit;
+          if (targetIdx >= totalChunks) break;
+          if (state.chunks[targetIdx]) {
+            if (bit < 32) {
+              sackLo = (sackLo | (1 << bit)) >>> 0;
+            } else {
+              sackHi = (sackHi | (1 << (bit - 32))) >>> 0;
+            }
+          }
+        }
+        ackDv.setUint32(12, sackHi, false);
+        ackDv.setUint32(16, sackLo, false);
         channel.sendEncrypted(PKT_DATA_ACK, ackBuf);
         return;
       }

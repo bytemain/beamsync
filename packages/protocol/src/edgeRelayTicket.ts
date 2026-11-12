@@ -8,8 +8,7 @@ export interface EdgeRelayNodeInfo {
   stunUrl?: string;
   /**
    * Optional SHA-256 fingerprint (64 lowercase hex chars) of the relay's raw DER X.509 certificate.
-   * Mirrors Tailscale DERP `CertName: "sha256-raw:..."`: enables IP-only + self-signed TLS
-   * deployments (e.g. Shanghai / domestic cloud VMs with zero domain name and zero ICP filing).
+   * Enables IP-only + self-signed TLS deployments (e.g. Shanghai / domestic cloud VMs with zero domain name and zero ICP filing).
    */
   certSha256?: string;
   /**

@@ -38,14 +38,14 @@ async function populateCodeWorkspace(
   }
 }
 
-describe("DERP-style Stateless Multi-Region Edge Relay (@beamsync/edge-relay)", () => {
+describe("Stateless Multi-Region Edge Relay (@beamsync/edge-relay)", () => {
   let tmpRoot: string;
   let server: RunningBeamSyncServer | null = null;
   const relays: RunningEdgeRelayServer[] = [];
-  const RELAY_SECRET = "test-derp-shared-hmac-secret-2026";
+  const RELAY_SECRET = "test-edge-relay-shared-hmac-secret-2026";
 
   beforeEach(async () => {
-    tmpRoot = await mkdtemp(path.join(os.tmpdir(), "beamsync-derp-e2e-"));
+    tmpRoot = await mkdtemp(path.join(os.tmpdir(), "beamsync-edge-e2e-"));
   });
 
   afterEach(async () => {
@@ -60,7 +60,7 @@ describe("DERP-style Stateless Multi-Region Edge Relay (@beamsync/edge-relay)", 
     await rm(tmpRoot, { recursive: true, force: true });
   });
 
-  it("auto-registers regional DERP nodes via signed heartbeats, selects minimum-RTT region (sgp < tyo), and streams with zero R2 writes", async () => {
+  it("auto-registers regional Edge Relay nodes via signed heartbeats, selects minimum-RTT region (sgp < tyo), and streams with zero R2 writes", async () => {
     const objectEvents: ObjectStoreHookEvent[] = [];
     server = await startBeamSyncServer({
       port: 0,
@@ -72,7 +72,7 @@ describe("DERP-style Stateless Multi-Region Edge Relay (@beamsync/edge-relay)", 
     });
 
     const tyoRelay = await startEdgeRelayServer({
-      relayId: "derp-tyo-1",
+      relayId: "relay-tyo-1",
       region: "tyo",
       authSecret: RELAY_SECRET,
       port: 0,
@@ -84,7 +84,7 @@ describe("DERP-style Stateless Multi-Region Edge Relay (@beamsync/edge-relay)", 
     relays.push(tyoRelay);
 
     const sgpRelay = await startEdgeRelayServer({
-      relayId: "derp-sgp-1",
+      relayId: "relay-sgp-1",
       region: "sgp",
       authSecret: RELAY_SECRET,
       port: 0,
@@ -95,13 +95,14 @@ describe("DERP-style Stateless Multi-Region Edge Relay (@beamsync/edge-relay)", 
     });
     relays.push(sgpRelay);
 
-    // Doctor netcheck should discover both DERP relays and measure lower RTT to sgp
+    // Doctor check should discover both Edge Relays, classify local Cone NAT across multiple STUN servers, and measure lower RTT to sgp
     const doc = await runDoctor(server.httpUrl);
-    expect(doc.edgeRelayRttMs["derp-sgp-1"]).toBeDefined();
-    expect(doc.edgeRelayRttMs["derp-tyo-1"]).toBeDefined();
-    expect(doc.edgeRelayRttMs["derp-sgp-1"]).toBeLessThan(
-      doc.edgeRelayRttMs["derp-tyo-1"],
+    expect(doc.edgeRelayRttMs["relay-sgp-1"]).toBeDefined();
+    expect(doc.edgeRelayRttMs["relay-tyo-1"]).toBeDefined();
+    expect(doc.edgeRelayRttMs["relay-sgp-1"]).toBeLessThan(
+      doc.edgeRelayRttMs["relay-tyo-1"],
     );
+    expect(doc.natMapping).toBe("endpoint_independent");
 
     const sourceDir = path.join(tmpRoot, "src");
     const targetDir = path.join(tmpRoot, "dst");
@@ -143,7 +144,7 @@ describe("DERP-style Stateless Multi-Region Edge Relay (@beamsync/edge-relay)", 
     expect(recvSummary.selectedEdgeRelayRegion).toBe("sgp");
     expect(sendSummary.fallbackToR2Triggered).toBe(false);
 
-    // Zero object-store / R2 writes occurred; traffic cut through sgp DERP node only
+    // Zero object-store / R2 writes occurred; traffic cut through sgp Edge Relay node only
     expect(objectEvents).toHaveLength(0);
     expect(sgpRelay.getStats().totalRelayedBytes).toBeGreaterThan(0);
     expect(tyoRelay.getStats().totalRelayedBytes).toBe(0);
@@ -168,14 +169,14 @@ describe("DERP-style Stateless Multi-Region Edge Relay (@beamsync/edge-relay)", 
 
     // Domainless IP + self-signed TLS node (Shanghai VM scenario: zero domain, zero ICP filing)
     const shaRelay = await startEdgeRelayServer({
-      relayId: "derp-sha-ip",
+      relayId: "relay-sha-ip",
       region: "sha",
       authSecret: RELAY_SECRET,
       port: 0,
       host: "127.0.0.1",
       publicIp: "127.0.0.1",
       tlsMode: "self-signed",
-      tlsCacheFile: path.join(tmpRoot, "sha-derp-tls.json"),
+      tlsCacheFile: path.join(tmpRoot, "sha-edge-relay-tls.json"),
       stunPort: 0,
       coordinatorUrl: server.httpUrl,
     });
@@ -190,7 +191,7 @@ describe("DERP-style Stateless Multi-Region Edge Relay (@beamsync/edge-relay)", 
     const targetDir = path.join(tmpRoot, "sha-dst");
     await populateCodeWorkspace(sourceDir, 20, 8_000);
 
-    const sharedPhrase = "shanghai-ip-derp-test";
+    const sharedPhrase = "shanghai-ip-edge-relay-test";
     const [sendSummary, recvSummary] = await Promise.all([
       sendDirectory({
         serverUrl: server.httpUrl,
@@ -229,7 +230,7 @@ describe("DERP-style Stateless Multi-Region Edge Relay (@beamsync/edge-relay)", 
 
   it("strictly rejects forged relay tickets (HTTP 403) and MITM certificate pin mismatches", async () => {
     const shaRelay = await startEdgeRelayServer({
-      relayId: "derp-sec-1",
+      relayId: "relay-sec-1",
       region: "sha",
       authSecret: RELAY_SECRET,
       port: 0,
@@ -244,7 +245,7 @@ describe("DERP-style Stateless Multi-Region Edge Relay (@beamsync/edge-relay)", 
     await expect(
       new Promise<void>((resolve, reject) => {
         const ws = new WebSocket(
-          `${shaRelay.wsUrl}/v1/relay/fake-session?relayId=derp-sec-1&role=source&exp=${Date.now() + 60_000}&ticket=deadbeef`,
+          `${shaRelay.wsUrl}/v1/relay/fake-session?relayId=relay-sec-1&role=source&exp=${Date.now() + 60_000}&ticket=deadbeef`,
           { rejectUnauthorized: false },
         );
         ws.once("open", () => {
@@ -259,7 +260,7 @@ describe("DERP-style Stateless Multi-Region Edge Relay (@beamsync/edge-relay)", 
     const bogusPin = "f".repeat(64);
     await expect(
       connectEdgeRelayBinaryChannel({
-        wsRelayUrl: `${shaRelay.wsUrl}/v1/relay/fake-session?relayId=derp-sec-1&role=source&exp=${Date.now() + 60_000}&ticket=deadbeef`,
+        wsRelayUrl: `${shaRelay.wsUrl}/v1/relay/fake-session?relayId=relay-sec-1&role=source&exp=${Date.now() + 60_000}&ticket=deadbeef`,
         role: "source",
         transportKey: crypto.randomBytes(32),
         sessionId: "fake-session",
@@ -269,7 +270,7 @@ describe("DERP-style Stateless Multi-Region Edge Relay (@beamsync/edge-relay)", 
     ).rejects.toThrow(/EDGE_RELAY_CERT_PIN_MISMATCH/);
   });
 
-  it("seamlessly falls back from EDGE_RELAY to R2_PIPELINE mid-transfer if the DERP node drops", async () => {
+  it("seamlessly falls back from EDGE_RELAY to R2_PIPELINE mid-transfer if the Edge Relay node drops", async () => {
     const objectEvents: ObjectStoreHookEvent[] = [];
     server = await startBeamSyncServer({
       port: 0,
@@ -281,7 +282,7 @@ describe("DERP-style Stateless Multi-Region Edge Relay (@beamsync/edge-relay)", 
     });
 
     const edgeRelay = await startEdgeRelayServer({
-      relayId: "derp-hkg-1",
+      relayId: "relay-hkg-1",
       region: "hkg",
       authSecret: RELAY_SECRET,
       port: 0,
@@ -296,7 +297,7 @@ describe("DERP-style Stateless Multi-Region Edge Relay (@beamsync/edge-relay)", 
     // 24 files * 16 KB = ~384 KB -> ~8 packs at 48 KB targetPackBytes
     await populateCodeWorkspace(sourceDir, 24, 16_384);
 
-    const phrase = "derp-fallback-r2-test";
+    const phrase = "edge-relay-fallback-r2-test";
     const [sendSummary, recvSummary] = await Promise.all([
       sendDirectory({
         serverUrl: server.httpUrl,
@@ -324,7 +325,7 @@ describe("DERP-style Stateless Multi-Region Edge Relay (@beamsync/edge-relay)", 
     expect(sendSummary.selectedEdgeRelayRegion).toBe("hkg");
     expect(sendSummary.packCount).toBeGreaterThan(3);
 
-    // First 2 packs went over DERP; only remaining packs hit object storage
+    // First 2 packs went over Edge Relay; only remaining packs hit object storage
     const putEvents = objectEvents.filter((e) => e.method === "PUT");
     expect(putEvents.length).toBe(sendSummary.packCount - 2);
     expect(edgeRelay.getStats().totalRelayedBytes).toBeGreaterThan(0);
